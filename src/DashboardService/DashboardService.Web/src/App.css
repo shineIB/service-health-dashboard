@@ -1,0 +1,198 @@
+/* Ops view, not a landing page: flat colors, no gradients, no shadows for their own
+   sake. Every color used carries a meaning (status) or is part of the neutral chrome. */
+
+:root {
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --border: #dfe2e7;
+  --text-primary: #14181f;
+  --text-secondary: #4b5361;
+  --text-tertiary: #7d8492;
+
+  --healthy-bg: #e5f5ea;
+  --healthy-fg: #1a7f37;
+  --healthy-border: #1a7f37;
+
+  --unhealthy-bg: #fdf1de;
+  --unhealthy-fg: #92600a;
+  --unhealthy-border: #92600a;
+
+  --unreachable-fg: #b3261e;
+  --unreachable-border: #b3261e;
+
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --surface: #151b23;
+    --border: #2d3542;
+    --text-primary: #e6edf3;
+    --text-secondary: #9aa4b2;
+    --text-tertiary: #6c7684;
+
+    --healthy-bg: #0f2a1a;
+    --healthy-fg: #4cb865;
+    --healthy-border: #3a8f52;
+
+    --unhealthy-bg: #332508;
+    --unhealthy-fg: #dba53a;
+    --unhealthy-border: #b6862e;
+
+    --unreachable-fg: #f0645c;
+    --unreachable-border: #c94840;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+.page {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem 3rem;
+}
+
+.page-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+  flex-wrap: wrap;
+}
+
+.page-header h1 {
+  font-size: 1.25rem;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+/* The "next update" indicator: static text that ticks once a second, no animation,
+   no spinner — meant to be checked, not noticed. */
+.poll-indicator {
+  font-size: 0.8rem;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.fetch-error {
+  color: var(--unreachable-fg);
+  font-size: 0.9rem;
+  margin: 0 0 1rem;
+}
+
+.service-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.service-table th {
+  text-align: left;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-tertiary);
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.service-table td {
+  padding: 0.85rem 1rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.9rem;
+  vertical-align: middle;
+}
+
+.service-table tr:last-child td {
+  border-bottom: none;
+}
+
+/* A colored left edge per row: status is legible in peripheral vision, before reading
+   any text at all. Meaningful (it repeats the badge's status), not decorative. */
+.row {
+  border-left: 4px solid transparent;
+}
+
+.row--healthy {
+  border-left-color: var(--healthy-border);
+}
+
+.row--unhealthy {
+  border-left-color: var(--unhealthy-border);
+}
+
+.row--unreachable {
+  border-left-color: var(--unreachable-border);
+}
+
+.service-name {
+  font-weight: 600;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.git-sha {
+  color: var(--text-tertiary);
+}
+
+.empty-state {
+  color: var(--text-tertiary);
+  text-align: center;
+  padding: 2rem 1rem;
+}
+
+/* Status badge: color + icon shape + fill style all encode the same status, so it
+   survives grayscale and doesn't rely on hue alone. Sized to be read from a distance. */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  padding: 0.32em 0.8em;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  border: 1.5px solid transparent;
+  white-space: nowrap;
+}
+
+.status-badge--healthy {
+  background: var(--healthy-bg);
+  color: var(--healthy-fg);
+  border-color: var(--healthy-border);
+}
+
+.status-badge--unhealthy {
+  background: var(--unhealthy-bg);
+  color: var(--unhealthy-fg);
+  border-color: var(--unhealthy-border);
+}
+
+/* Unreachable is not "red like Unhealthy": hollow fill + dashed border, not a solid
+   pill, so the two are unmistakable even at a glance. */
+.status-badge--unreachable {
+  background: transparent;
+  color: var(--unreachable-fg);
+  border-color: var(--unreachable-border);
+  border-style: dashed;
+}

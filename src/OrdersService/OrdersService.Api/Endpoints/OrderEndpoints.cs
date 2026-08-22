@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Http.HttpResults;
+using Microsoft.Extensions.Logging;
 using OrdersService.Api.Contracts;
 using OrdersService.Domain;
 
@@ -6,6 +7,9 @@ namespace OrdersService.Api.Endpoints;
 
 public static class OrderEndpoints
 {
+    // ILogger<T> needs a non-static type argument; this exists only to name the log category.
+    private sealed class LogCategory;
+
     public static RouteGroupBuilder MapOrderEndpoints(this RouteGroupBuilder group)
     {
         group.MapPost("/", CreateOrder);
@@ -104,6 +108,8 @@ public static class OrderEndpoints
     private static async Task<Results<Ok<OrderResponse>, NotFound>> CancelOrder(
         Guid id,
         IOrderRepository repository,
+        IInventoryClient inventoryClient,
+        ILogger<LogCategory> logger,
         CancellationToken cancellationToken)
     {
         var order = await repository.GetByIdAsync(id, cancellationToken);
@@ -112,6 +118,25 @@ public static class OrderEndpoints
 
         order.Cancel();
         await repository.SaveChangesAsync(cancellationToken);
+
+        // The cancellation itself is already committed above: releasing the reservation
+        // is a best-effort side effect, not a precondition. If it fails, the order stays
+        // cancelled anyway — inventory-service's reservation TTL reclaims the stock on
+        // its own, the same backstop CreateOrder relies on for the reverse case.
+        foreach (var line in order.Lines)
+        {
+            var result = await inventoryClient.ReleaseStockAsync(order.Id, line.ProductId, cancellationToken);
+            if (result.Outcome == ReleaseStockOutcome.Unavailable)
+            {
+                logger.LogWarning(
+                    "Failed to release reservation for order {OrderId}, product {ProductId}: {Message}. " +
+                    "The reservation's TTL in inventory-service will reclaim it automatically.",
+                    order.Id,
+                    line.ProductId,
+                    result.Message);
+            }
+        }
+
         return TypedResults.Ok(OrderResponse.FromDomain(order));
     }
 }

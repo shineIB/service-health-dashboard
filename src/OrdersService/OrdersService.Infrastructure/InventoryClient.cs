@@ -64,4 +64,29 @@ public sealed class InventoryClient : IInventoryClient
             return ReserveStockResult.Unavailable("inventory-service is unavailable.");
         }
     }
+
+    public async Task<ReleaseStockResult> ReleaseStockAsync(Guid orderId, Guid productId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var response = await _httpClient.PostAsJsonAsync(
+                $"/inventory/{productId}/release",
+                new { orderId },
+                cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+                return ReleaseStockResult.Released();
+
+            _logger.LogWarning(
+                "Unexpected response from inventory-service releasing product {ProductId}: {StatusCode}.",
+                productId,
+                response.StatusCode);
+            return ReleaseStockResult.Unavailable($"Unexpected response from inventory-service: {(int)response.StatusCode}.");
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TimeoutRejectedException or BrokenCircuitException)
+        {
+            _logger.LogWarning(ex, "inventory-service unavailable while releasing stock for product {ProductId}.", productId);
+            return ReleaseStockResult.Unavailable("inventory-service is unavailable.");
+        }
+    }
 }

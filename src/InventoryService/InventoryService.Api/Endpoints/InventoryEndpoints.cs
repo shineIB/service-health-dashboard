@@ -1,6 +1,8 @@
 using Microsoft.AspNetCore.Http.HttpResults;
+using Microsoft.Extensions.Options;
 using InventoryService.Api.Contracts;
 using InventoryService.Domain;
+using InventoryService.Infrastructure;
 
 namespace InventoryService.Api.Endpoints;
 
@@ -56,17 +58,23 @@ public static class InventoryEndpoints
         return TypedResults.Ok(items.Select(InventoryItemResponse.FromDomain).ToList());
     }
 
+    // DomainException (including InsufficientStockException) is not caught here: it
+    // propagates to DomainExceptionHandler, which maps insufficient stock to 409 and
+    // every other domain rule violation to 400.
     private static async Task<Results<Ok<InventoryItemResponse>, NotFound>> ReserveStock(
         Guid productId,
         ReserveStockRequest request,
         IInventoryRepository repository,
+        IOptions<ReservationOptions> reservationOptions,
+        TimeProvider timeProvider,
         CancellationToken cancellationToken)
     {
         var item = await repository.GetByProductIdAsync(productId, cancellationToken);
         if (item is null)
             return TypedResults.NotFound();
 
-        item.Reserve(request.Quantity);
+        var ttl = TimeSpan.FromSeconds(reservationOptions.Value.TtlSeconds);
+        item.Reserve(request.OrderId, request.Quantity, ttl, timeProvider.GetUtcNow());
         await repository.SaveChangesAsync(cancellationToken);
         return TypedResults.Ok(InventoryItemResponse.FromDomain(item));
     }
@@ -81,7 +89,7 @@ public static class InventoryEndpoints
         if (item is null)
             return TypedResults.NotFound();
 
-        item.Release(request.Quantity);
+        item.Release(request.OrderId);
         await repository.SaveChangesAsync(cancellationToken);
         return TypedResults.Ok(InventoryItemResponse.FromDomain(item));
     }

@@ -64,7 +64,9 @@ public class InventoryEndpointsTests : IClassFixture<InventoryApiFactory>
         var productId = Guid.NewGuid();
         await client.PostAsJsonAsync("/inventory", new { productId, initialQuantity = 10 });
 
-        var response = await client.PostAsJsonAsync($"/inventory/{productId}/reserve", new { quantity = 4 });
+        var response = await client.PostAsJsonAsync(
+            $"/inventory/{productId}/reserve",
+            new { orderId = Guid.NewGuid(), quantity = 4 });
 
         response.StatusCode.Should().Be(HttpStatusCode.OK);
 
@@ -74,15 +76,36 @@ public class InventoryEndpointsTests : IClassFixture<InventoryApiFactory>
     }
 
     [Fact]
-    public async Task Reserve_WithInsufficientStock_Returns400WithProblemDetails()
+    public async Task Reserve_CalledTwiceWithSameOrderId_IsIdempotentAndDoesNotDoubleReserve()
+    {
+        var client = _factory.CreateClient();
+        var productId = Guid.NewGuid();
+        var orderId = Guid.NewGuid();
+        await client.PostAsJsonAsync("/inventory", new { productId, initialQuantity = 10 });
+
+        var first = await client.PostAsJsonAsync($"/inventory/{productId}/reserve", new { orderId, quantity = 4 });
+        var second = await client.PostAsJsonAsync($"/inventory/{productId}/reserve", new { orderId, quantity = 4 });
+
+        first.StatusCode.Should().Be(HttpStatusCode.OK);
+        second.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var body = await second.Content.ReadFromJsonAsync<InventoryItemResponse>();
+        body!.AvailableQuantity.Should().Be(6, "a retried reserve for the same order must not reserve twice");
+        body.ReservedQuantity.Should().Be(4);
+    }
+
+    [Fact]
+    public async Task Reserve_WithInsufficientStock_Returns409WithProblemDetails()
     {
         var client = _factory.CreateClient();
         var productId = Guid.NewGuid();
         await client.PostAsJsonAsync("/inventory", new { productId, initialQuantity = 2 });
 
-        var response = await client.PostAsJsonAsync($"/inventory/{productId}/reserve", new { quantity = 5 });
+        var response = await client.PostAsJsonAsync(
+            $"/inventory/{productId}/reserve",
+            new { orderId = Guid.NewGuid(), quantity = 5 });
 
-        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        response.StatusCode.Should().Be(HttpStatusCode.Conflict);
 
         var problem = await response.Content.ReadFromJsonAsync<ProblemDetails>();
         problem!.Detail.Should().Contain("Insufficient stock");
@@ -93,20 +116,23 @@ public class InventoryEndpointsTests : IClassFixture<InventoryApiFactory>
     {
         var client = _factory.CreateClient();
 
-        var response = await client.PostAsJsonAsync($"/inventory/{Guid.NewGuid()}/reserve", new { quantity = 1 });
+        var response = await client.PostAsJsonAsync(
+            $"/inventory/{Guid.NewGuid()}/reserve",
+            new { orderId = Guid.NewGuid(), quantity = 1 });
 
         response.StatusCode.Should().Be(HttpStatusCode.NotFound);
     }
 
     [Fact]
-    public async Task Release_WithSufficientReservedStock_MovesQuantityBackToAvailable()
+    public async Task Release_WithActiveReservation_MovesQuantityBackToAvailable()
     {
         var client = _factory.CreateClient();
         var productId = Guid.NewGuid();
+        var orderId = Guid.NewGuid();
         await client.PostAsJsonAsync("/inventory", new { productId, initialQuantity = 10 });
-        await client.PostAsJsonAsync($"/inventory/{productId}/reserve", new { quantity = 4 });
+        await client.PostAsJsonAsync($"/inventory/{productId}/reserve", new { orderId, quantity = 4 });
 
-        var response = await client.PostAsJsonAsync($"/inventory/{productId}/release", new { quantity = 4 });
+        var response = await client.PostAsJsonAsync($"/inventory/{productId}/release", new { orderId });
 
         response.StatusCode.Should().Be(HttpStatusCode.OK);
 
@@ -116,11 +142,25 @@ public class InventoryEndpointsTests : IClassFixture<InventoryApiFactory>
     }
 
     [Fact]
+    public async Task Release_ForOrderWithNoReservation_IsANoOpReturning200()
+    {
+        var client = _factory.CreateClient();
+        var productId = Guid.NewGuid();
+        await client.PostAsJsonAsync("/inventory", new { productId, initialQuantity = 10 });
+
+        var response = await client.PostAsJsonAsync($"/inventory/{productId}/release", new { orderId = Guid.NewGuid() });
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+    }
+
+    [Fact]
     public async Task Release_ForUnknownProduct_Returns404()
     {
         var client = _factory.CreateClient();
 
-        var response = await client.PostAsJsonAsync($"/inventory/{Guid.NewGuid()}/release", new { quantity = 1 });
+        var response = await client.PostAsJsonAsync(
+            $"/inventory/{Guid.NewGuid()}/release",
+            new { orderId = Guid.NewGuid() });
 
         response.StatusCode.Should().Be(HttpStatusCode.NotFound);
     }

@@ -11,6 +11,23 @@ public sealed class DomainExceptionHandler : IExceptionHandler
         Exception exception,
         CancellationToken cancellationToken)
     {
+        // Insufficient stock is a valid business outcome, not an invalid request —
+        // it gets 409 so callers (and their retry policies) can tell it apart from
+        // a genuinely malformed request (400) or a transient failure (5xx/408).
+        if (exception is InsufficientStockException insufficientStockException)
+        {
+            httpContext.Response.StatusCode = StatusCodes.Status409Conflict;
+
+            await httpContext.Response.WriteAsJsonAsync(new ProblemDetails
+            {
+                Status = StatusCodes.Status409Conflict,
+                Title = "Insufficient stock.",
+                Detail = insufficientStockException.Message
+            }, cancellationToken);
+
+            return true;
+        }
+
         if (exception is not DomainException domainException)
             return false;
 

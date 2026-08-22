@@ -27,9 +27,12 @@ services:
     environment:
       Infrastructure__ConnectionString: "Host=postgres;Port=5432;Database=orders;Username=orders;Password=orders"
       Database__RunMigrationsOnStartup: "true"
+      InventoryClient__BaseUrl: "http://inventory-service:8080"
     depends_on:
       postgres:
         condition: service_healthy
+      inventory-service:
+        condition: service_started
 
   inventory-postgres:
     image: postgres:16-alpine

@@ -20,12 +20,14 @@ public sealed class InventoryRepository : IInventoryRepository
     public async Task<InventoryItem?> GetByProductIdAsync(Guid productId, CancellationToken cancellationToken)
     {
         return await _dbContext.Items
+            .Include(i => i.Reservations)
             .FirstOrDefaultAsync(i => i.ProductId == productId, cancellationToken);
     }
 
     public async Task<IReadOnlyList<InventoryItem>> GetAllAsync(CancellationToken cancellationToken)
     {
         return await _dbContext.Items
+            .Include(i => i.Reservations)
             .OrderBy(i => i.ProductId)
             .ToListAsync(cancellationToken);
     }

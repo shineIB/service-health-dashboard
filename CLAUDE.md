@@ -172,8 +172,81 @@ Istället, styrt av flaggan `Database:RunMigrationsOnStartup`:
   liveness/readiness-isolering som orders (stoppar man `inventory-postgres` går
   bara inventory-service `/health/ready` till 503 — orders-service påverkas inte).
 
-Nästa steg: steg 3, del 2 — orders anropar inventory synkront via HTTP vid
-orderskapande (reservera saldo för varje rad innan ordern accepteras). Hantera
-fel när inventory är nere (timeout, retry, fallback) — kräver ett beslut om
-fallback-beteende (avvisa ordern vid osäkert lagersaldo, kontra acceptera
-optimistiskt) innan implementation.
+**Steg 3, del 2 — orders → inventory över HTTP, med resiliens. Klart och verifierat.**
+
+**Beslut — fail-closed.** En order avvisas om lagret inte kan reserveras eller
+inventory är onåbar, hellre än att acceptera optimistiskt. Motivering: det här
+är en lagerreservation, inte en "best effort"-notifiering — att acceptera
+ordrar utan bekräftat saldo riskerar oversälj, vilket är dyrare att reda ut i
+efterhand än att en kund får se ett tillfälligt fel.
+
+- **Typad `HttpClient` med `Microsoft.Extensions.Http.Resilience`** (Polly v8),
+  registrerad i `OrdersService.Infrastructure/ServiceCollectionExtensions.cs`
+  via `AddStandardResilienceHandler`: per-försök-timeout 2s, totalt 8s,
+  2 omförsök med exponentiell backoff + jitter (200ms bas), circuit breaker
+  (50% felkvot, min. 4 anrop, 10s samplingsfönster, 15s brytningstid).
+  Default-`ShouldHandle`-predikatet (`HttpClientResiliencePredicates.IsTransient`)
+  används oförändrat — det omfattar redan 5xx/408/429 och nätverks-/timeout-fel,
+  och exkluderar redan 4xx. Alltså: **inget** omförsök på 409/404 utan att
+  behöva skriva ett eget predikat.
+- **409 vs 400 i inventory:** `InsufficientStockException` (ärver
+  `DomainException`, avsiktligt inte `sealed` längre) mappas till 409 Conflict,
+  inte 400 — otillräckligt saldo är ett giltigt affärssvar, inte ett ogiltigt
+  request. Det är därför omförsök aldrig triggas på det svaret (se ovan).
+  Orders mappar i sin tur inventory:s 409/404 till ett eget 409 ("Order
+  rejected: insufficient stock.") till sin egen anropare.
+- **Idempotens:** `POST /inventory/{productId}/reserve` tar `orderId` som
+  idempotensnyckel. `InventoryItem.Reserve(orderId, quantity, ttl, now)` kollar
+  om en reservation för det `orderId` redan finns för den artikeln — om ja,
+  no-op (samma resultat returneras, saldot rörs inte igen). En omförsökt
+  request (t.ex. efter en timeout där inventory faktiskt hann reservera innan
+  svaret gick förlorat) dubbelreserverar alltså inte.
+- **Reservationer har TTL, inte kompenserande release-anrop.** Varje
+  reservation får en `ExpiresAtUtc` (`Reservation:TtlSeconds`, default 900s)
+  och en bakgrundstjänst (`ReservationExpiryService`, `BackgroundService`) sveper
+  var `Reservation:ExpirySweepIntervalSeconds` (default 30s) och släpper saldo
+  för förfallna reservationer automatiskt.
+  **Varför TTL och inte ett kompenserande `release`-anrop när en order
+  misslyckas efter en lyckad reservation:** ett kompenserande anrop går genom
+  samma inventory-service som redan kan vara den tjänst som är nere — det är
+  inte garanterat att lyckas när det som mest behövs. TTL kräver inte att
+  någon annan tjänst är uppe, inte att den här processen ens överlever
+  (krasch efter reservation men innan orderns commit läcker inte saldo
+  permanent), och är därför den enda mekanismen som faktiskt håller sitt
+  löfte oavsett vad som gick fel. Reservationer i orders-service-flödet för
+  rader *före* den rad som fick 409/503 lämnas därför medvetet oreleasade —
+  TTL:en städar upp dem.
+- **503 + `Retry-After`, inte 500.** När inventory är onåbar (timeout,
+  circuit open, nätverksfel) svarar `POST /orders` 503 med
+  `Retry-After: 5`, inte ett okontrollerat 500 — anroparen ska kunna
+  skilja "försök igen om en liten stund" (503) från "din request var
+  ogiltig" (400) och "ditt lager räcker inte" (409).
+- **Testtäckning:** `InventoryItemTests` (domän) testar idempotent
+  omreservering, TTL-förfall (deterministiskt via injicerad `now`, inte
+  väggklocka), och att förfallet saldo kan återanvändas. `ReservationExpiryTests`
+  (API) verifierar bakgrundssvepet på riktigt (kort TTL/intervall, 3s väntan,
+  ingen mockning). `OrderEndpointsTests` använder en `FakeInventoryClient`
+  (ingen riktig inventory-service behövs för orders-testerna) och täcker
+  lyckad reservation (201), otillräckligt saldo (409) och onåbar inventory
+  (503 + `Retry-After`). Alla 49 tester i lösningen gröna.
+- **Verifierat på riktigt mot Docker-stacken** (inte bara enhetstester):
+  `docker compose up --build`, skapade lager, skapade en order (reserverar
+  korrekt, saldo minskar), stoppade `inventory-service`-containern och
+  bekräftade att `POST /orders` svarar 503 med `Retry-After: 5` efter
+  ~6,5s (matchar 3 försök × 2s timeout + backoff). Skickade därefter fler
+  requests och bekräftade att circuit breakern slår till: svarstiden föll
+  till ~4ms och loggarna visade `Polly.CircuitBreaker.BrokenCircuitException`.
+  `orders-service`s egna `/health/live` och `/health/ready` förblev 200 hela
+  tiden (readiness beror bara på orders egen Postgres, inte på inventory).
+  Startade `inventory-service` igen, väntade ut brytningstiden (15s) och
+  bekräftade att circuit breakern stängdes automatiskt och en ny order
+  lyckades (201) med korrekt uppdaterat saldo.
+- **En känd, medveten begränsning:** `CancelOrder` anropar ännu inte
+  inventory:s `/release` — en avbokad order håller kvar sin reservation tills
+  TTL:en löper ut. Inte i scope för del 2; naturlig utökning när det behövs.
+
+Nästa steg: steg 4 — Kubernetes-manifest (Deployment, Service, ConfigMap,
+Secret, probes) för båda tjänsterna, kör i minikube. Migrationsflaggan
+(`Database:RunMigrationsOnStartup`) ska då bli `false` för båda tjänsterna,
+med migrationen körd som ett separat Job/initContainer istället — se beslutet
+längre upp i det här dokumentet.

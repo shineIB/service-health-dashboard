@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using InventoryService.Domain;
 
 namespace InventoryService.Infrastructure;
@@ -15,6 +16,10 @@ public static class ServiceCollectionExtensions
         services.AddDbContext<InventoryDbContext>(builder => builder.UseNpgsql(options.ConnectionString));
 
         services.AddScoped<IInventoryRepository, InventoryRepository>();
+
+        services.Configure<ReservationOptions>(configuration.GetSection(ReservationOptions.SectionName));
+        services.AddHostedService<ReservationExpiryService>();
+        services.TryAddSingleton(TimeProvider.System);
 
         services.AddHealthChecks()
             .AddCheck<PostgresHealthCheck>(name: "postgres", tags: ["ready"], timeout: TimeSpan.FromSeconds(2));

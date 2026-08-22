@@ -4,9 +4,10 @@ namespace InventoryService.Api.Contracts;
 
 public sealed record CreateInventoryItemRequest(Guid ProductId, int InitialQuantity);
 
-public sealed record ReserveStockRequest(int Quantity);
+// OrderId is the idempotency key: a retried reserve for the same order is a no-op.
+public sealed record ReserveStockRequest(Guid OrderId, int Quantity);
 
-public sealed record ReleaseStockRequest(int Quantity);
+public sealed record ReleaseStockRequest(Guid OrderId);
 
 public sealed record InventoryItemResponse(Guid ProductId, int AvailableQuantity, int ReservedQuantity)
 {

@@ -1,0 +1,44 @@
+@InventoryService.Api_HostAddress = http://localhost:5030
+
+GET {{InventoryService.Api_HostAddress}}/health/live
+Accept: application/json
+
+###
+
+GET {{InventoryService.Api_HostAddress}}/health/ready
+Accept: application/json
+
+###
+
+POST {{InventoryService.Api_HostAddress}}/inventory
+Content-Type: application/json
+
+{
+  "productId": "22222222-2222-2222-2222-222222222222",
+  "initialQuantity": 100
+}
+
+###
+
+GET {{InventoryService.Api_HostAddress}}/inventory
+Accept: application/json
+
+###
+
+POST {{InventoryService.Api_HostAddress}}/inventory/22222222-2222-2222-2222-222222222222/reserve
+Content-Type: application/json
+
+{
+  "quantity": 2
+}
+
+###
+
+POST {{InventoryService.Api_HostAddress}}/inventory/22222222-2222-2222-2222-222222222222/release
+Content-Type: application/json
+
+{
+  "quantity": 2
+}
+
+###

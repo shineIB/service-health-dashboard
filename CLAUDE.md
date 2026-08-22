@@ -142,6 +142,38 @@ Istället, styrt av flaggan `Database:RunMigrationsOnStartup`:
   introducera en ny felväg. Regressionstest tillagt
   (`CreateOrder_WithMissingItems_Returns400WithProblemDetails`).
 
-Nästa steg: steg 3 — `inventory-service`, samma mönster som orders-service.
-Orders anropar inventory synkront via HTTP; hantera fel när inventory är
-nere (timeout, retry, fallback).
+**Steg 3, del 1 — `inventory-service` klart och verifierat. Del 2 (orders → inventory) återstår.**
+
+- `inventory-service` skapad i `src/InventoryService/` med samma `Api` / `Domain` /
+  `Infrastructure`-mönster som orders-service, egen databas (`inventory`, inte delad
+  med orders).
+- Domänmodell: `InventoryItem` (aggregate root), nyckel `ProductId`. Håller
+  `AvailableQuantity` och `ReservedQuantity` separat (inte bara ett saldo) — ger
+  orders-service en naturlig plats att reservera saldo vid orderskapande och släppa
+  det vid avbokning. `Reserve`/`Release` validerar i domänen och kastar
+  `DomainException` vid otillräckligt saldo eller ogiltig kvantitet.
+- Endpoints: `POST /inventory` (skapa/seeda artikel — 400 om produkten redan finns),
+  `GET /inventory`, `GET /inventory/{productId}`, `POST /inventory/{productId}/reserve`,
+  `POST /inventory/{productId}/release`. Samma `DomainExceptionHandler`-mönster som
+  orders (400 + ProblemDetails), 404 vid okänd produkt.
+- Health checks (`/health/live`, `/health/ready`), `/version`, migrationsflagga
+  (`Database:RunMigrationsOnStartup`) — samma mönster som orders-service från start,
+  ingen uppdelning i steg den här gången eftersom det redan är löst.
+- Dockerfile (samma multi-stage-mönster) + eget Postgres-block i
+  `docker-compose.yml` (`inventory-postgres`, port 5433 mot host för att inte
+  krocka med orders port 5432).
+- Tester: 11 domän-tester (xUnit + FluentAssertions) + 10 API-tester
+  (`WebApplicationFactory`, inkl. create/reserve/release, redan-existerar-fel,
+  otillräckligt-saldo-fel, 404 för okänd produkt). Alla 40 tester i lösningen
+  (orders + inventory) gröna.
+- Verifierat mot riktig Postgres via `docker compose up --build`: migration körs,
+  `/health/live`, `/health/ready`, `/version` svarar korrekt, full
+  create→reserve→release-flöde mot riktig databas, och samma
+  liveness/readiness-isolering som orders (stoppar man `inventory-postgres` går
+  bara inventory-service `/health/ready` till 503 — orders-service påverkas inte).
+
+Nästa steg: steg 3, del 2 — orders anropar inventory synkront via HTTP vid
+orderskapande (reservera saldo för varje rad innan ordern accepteras). Hantera
+fel när inventory är nere (timeout, retry, fallback) — kräver ett beslut om
+fallback-beteende (avvisa ordern vid osäkert lagersaldo, kontra acceptera
+optimistiskt) innan implementation.

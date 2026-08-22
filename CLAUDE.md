@@ -241,12 +241,99 @@ efterhand än att en kund får se ett tillfälligt fel.
   Startade `inventory-service` igen, väntade ut brytningstiden (15s) och
   bekräftade att circuit breakern stängdes automatiskt och en ny order
   lyckades (201) med korrekt uppdaterat saldo.
-- **En känd, medveten begränsning:** `CancelOrder` anropar ännu inte
-  inventory:s `/release` — en avbokad order håller kvar sin reservation tills
-  TTL:en löper ut. Inte i scope för del 2; naturlig utökning när det behövs.
+- **Gapet är åtgärdat:** `CancelOrder` anropar nu `IInventoryClient.ReleaseStockAsync`
+  för varje rad, genom samma resiliens-pipeline som `ReserveStockAsync`. Ordern
+  avbokas och sparas *innan* release-anropen görs — release är ett best-effort-
+  sidoeffekt, inte ett villkor. Om det failar loggas en varning
+  ("... TTL i inventory-service will reclaim it automatically") och
+  cancel-svaret blir ändå 200; samma TTL-backstop som ovan städar upp.
+  Täckt av `CancelOrder_ReleasesTheReservationForEachLine` och
+  `CancelOrder_WhenReleaseFails_StillCancelsTheOrder`.
 
-Nästa steg: steg 4 — Kubernetes-manifest (Deployment, Service, ConfigMap,
-Secret, probes) för båda tjänsterna, kör i minikube. Migrationsflaggan
-(`Database:RunMigrationsOnStartup`) ska då bli `false` för båda tjänsterna,
-med migrationen körd som ett separat Job/initContainer istället — se beslutet
-längre upp i det här dokumentet.
+## Steg 4 — Kubernetes (minikube). Klart och verifierat.
+
+Manifest under `k8s/`, en mapp per tjänst (`k8s/orders-service/`,
+`k8s/inventory-service/`) plus `k8s/namespace.yaml`. Rena YAML-manifest, ingen
+Helm — som planerat.
+
+**Beslut (redan fattade, dokumenteras här):**
+
+- **Postgres i klustret** som Deployment + PVC (`ReadWriteOnce`, 1Gi), en per
+  tjänst, `strategy: Recreate` (en RWO-PVC kan bara monteras av en pod åt
+  gången — `RollingUpdate` skulle deadlocka). Ingen operator (Zalando/
+  CloudNativePG), ingen StatefulSet — rätt avvägning för en enda lokal
+  dev-instans, inte för HA/backup-krav.
+- **Migrationer:** `Database__RunMigrationsOnStartup=false` på
+  Deployment-poddarna. Migrationen körs istället som ett separat `Job` per
+  tjänst (`orders-migrate` / `inventory-migrate`), en gång per deploy —
+  samma beslut som antecknades i steg 2, nu implementerat. Job-podden kör
+  samma image som Deployment men med `args: ["--migrate-only"]` och
+  `Database__RunMigrationsOnStartup=true`; `Program.cs` avslutar processen
+  direkt efter migrationen istället för att starta Kestrel (ny, liten
+  kodändring i båda tjänsternas `Program.cs` — annars skulle Job-podden aldrig
+  bli `Complete`, den skulle bara stå och lyssna för evigt). Ett
+  `initContainer` (`pg_isready`-loop mot respektive Postgres-Service) gör
+  Job:et korrekt även om det appliceras för sig, utan att förlita sig på
+  Kubernetes exponentiella Job-backoff (som annars kan dra ut på minuter).
+- **Secrets:** vanliga `Secret`-manifest med lokala dev-värden i klartext
+  (`stringData`, base64 vid `kubectl apply`, inte kryptering). Kommentar i
+  varje secret-manifest om att SOPS / Sealed Secrets / External Secrets
+  Operator vore rätt i produktion — medveten förenkling för lokal minikube,
+  inte en miss.
+- **Images:** byggda lokalt (`docker build -t orders-service:local ...` /
+  `inventory-service:local`) och laddade in med `minikube image load` — inget
+  externt registry. `imagePullPolicy: IfNotPresent` explicit på alla egna
+  containrar (Deployment + Job) så Kubernetes aldrig försöker hämta dem
+  någon annanstans ifrån.
+- **Exponering:** `inventory-service` och båda Postgres-Services är
+  `ClusterIP` — bara nåbara inifrån klustret. `orders-service` är `NodePort`,
+  nått utifrån via `minikube service orders-service -n
+  service-health-dashboard`. Ingen Ingress än.
+- **Probes** (motiverade, inte kopierade):
+  - `startupProbe`: `/health/live`, `periodSeconds: 2`, `failureThreshold: 15`
+    → ~30s budget för en kall start av en minimal-API-process (DI-container +
+    EF Core-modellbygge) på en resursbegränsad minikube-nod. Klart mer än de
+    ~1–2s det tar på en vanlig dev-maskin, men fångar ändå en genuint fastnad
+    pod långt innan den skulle hinna äta av livenessProbe:s
+    omstart-budget nedan.
+  - `livenessProbe`: `/health/live`, `periodSeconds: 10`, `timeoutSeconds: 2`,
+    `failureThreshold: 3` → ingen egen `initialDelaySeconds` behövs (den körs
+    först efter att `startupProbe` lyckats). 3×10s = 30s innan omstart:
+    liveness-fel triggar en full pod-omstart, så den ska absorbera en enstaka
+    långsam tick (t.ex. en GC-paus), inte reagera på första missen.
+  - `readinessProbe`: `/health/ready`, `periodSeconds: 5`, `timeoutSeconds: 2`,
+    `failureThreshold: 3` → kortare period än liveness med avsikt: readiness
+    kostar bara att podden plockas ur Service-endpoints (billigt, reversibelt),
+    så den får reagera snabbare — ~15s — när podden egen Postgres blir onåbar.
+- **Postgres-poddarna** har egna `readinessProbe`/`livenessProbe` via
+  `pg_isready` (exec), samma mönster som docker-compose:s healthcheck.
+
+**Verifierat på riktigt i minikube** (inte bara `kubectl apply` utan fel):
+
+1. `docker build` + `minikube image load` för båda tjänsterna, `kubectl apply`
+   i ordning: namespace → Postgres (Secret/PVC/Deployment/Service) → app-Secrets
+   → migration-Jobs (väntade in `condition=complete`, läste loggarna och såg
+   riktiga `Applying migration '...'`-rader) → app-Deployments/Services.
+2. Båda Deployments rullade ut rent (`kubectl rollout status`), båda poddarna
+   `1/1 Ready` — dvs. `startupProbe`/`readinessProbe` klarade sig utan
+   justering på första försöket.
+3. Nådde `orders-service` utifrån klustret via `minikube service
+   orders-service -n service-health-dashboard --url`, skapade en riktig order
+   över hela kedjan (host → NodePort → orders-service-pod → ClusterIP
+   `inventory-service:8080` → inventory-service-pod → dess Postgres):
+   `POST /orders` → 201, `inventory` gick från `available: 10` till
+   `available: 7, reserved: 3`.
+4. `kubectl scale deployment/inventory-service --replicas=0`. Ny `POST /orders`
+   svarade `503` med `Retry-After: 5` (samma resiliens-/fail-closed-beteende
+   som i Docker-verifieringen ovan, nu genom riktig k8s-DNS/Service-routing
+   utan endpoints). `orders-service`s egen pod förblev `1/1 Ready`,
+   `Restart Count: 0` hela tiden — readiness/liveness påverkas inte av att en
+   beroende tjänst saknar repliker, exakt som designat.
+5. `kubectl scale deployment/inventory-service --replicas=1`, väntade in
+   rollout. Ny `POST /orders` lyckades igen (201), och `inventory` visade
+   korrekt `available: 6, reserved: 4` (3 från innan + 1 ny) — full
+   återhämtning utan manuell inblandning.
+
+Nästa steg: steg 5 — dashboard. Ett aggregerings-API som frågar varje tjänsts
+`/health/*` och `/version`, plus en frontend som visar status, version och
+senaste deploy per tjänst.

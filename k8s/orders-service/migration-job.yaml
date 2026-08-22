@@ -1,0 +1,37 @@
+# Runs the migration once per deploy, as its own Job — not RunMigrationsOnStartup
+# on the Deployment's pods, which would race if there were ever more than one
+# replica (see the decision recorded in CLAUDE.md). Apply this after
+# postgres-deployment.yaml/postgres-service.yaml and before deployment.yaml.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: orders-migrate
+  namespace: service-health-dashboard
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        # Postgres' own readiness probe already gates this in normal use (the
+        # Deployment's rollout order gives it a head start), but a Job can be
+        # (re)applied on its own — this makes it correct even then, without
+        # relying on Job backoff/retry (whose exponential delay climbs to
+        # minutes) to paper over "Postgres wasn't up yet".
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - until pg_isready -h orders-postgres -p 5432 -U orders; do echo "waiting for orders-postgres"; sleep 2; done
+      containers:
+        - name: migrate
+          image: orders-service:local
+          imagePullPolicy: IfNotPresent
+          args: ["--migrate-only"]
+          env:
+            - name: Database__RunMigrationsOnStartup
+              value: "true"
+          envFrom:
+            - secretRef:
+                name: orders-service-secret

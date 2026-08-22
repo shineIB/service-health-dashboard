@@ -51,6 +51,14 @@ if (databaseOptions.RunMigrationsOnStartup)
     await dbContext.Database.MigrateAsync();
 }
 
+// Lets a Kubernetes Job run "dotnet InventoryService.Api.dll --migrate-only" to apply the
+// migration and exit 0, instead of starting Kestrel and blocking forever — a Job's pod
+// must terminate on its own for the Job to be considered complete.
+if (args.Contains("--migrate-only"))
+{
+    return;
+}
+
 app.Run();
 
 public partial class Program;

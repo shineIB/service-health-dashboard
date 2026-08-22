@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-service
+  namespace: service-health-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orders-service
+  template:
+    metadata:
+      labels:
+        app: orders-service
+    spec:
+      containers:
+        - name: orders-service
+          image: orders-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            # false here, not the docker-compose default of true: see the
+            # migration-Job decision above and in CLAUDE.md.
+            - name: Database__RunMigrationsOnStartup
+              value: "false"
+            - name: InventoryClient__BaseUrl
+              value: "http://inventory-service:8080"
+          envFrom:
+            - secretRef:
+                name: orders-service-secret
+          startupProbe:
+            # Budget: ~30s (15 x 2s) for a cold minimal-API start — DI container
+            # + EF Core model build — on a resource-constrained minikube node.
+            # Generous compared to the ~1-2s this takes on a dev machine, but a
+            # genuinely stuck pod still gets caught well before it would eat
+            # into livenessProbe's restart budget below.
+            httpGet:
+              path: /health/live
+              port: 8080
+            periodSeconds: 2
+            failureThreshold: 15
+          livenessProbe:
+            # Runs only once startupProbe has passed, so no separate initialDelay
+            # is needed here. 3 x 10s before a restart: liveness failures cause a
+            # full pod restart, so this should absorb one slow tick (e.g. a GC
+            # pause) rather than react to the first miss.
+            httpGet:
+              path: /health/live
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            # Shorter period than liveness: readiness only pulls the pod out of
+            # the Service's endpoints (cheap, reversible), so it can react faster
+            # when the pod's own Postgres becomes unreachable — about 15s here.
+            httpGet:
+              path: /health/ready
+              port: 8080
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3

@@ -1,0 +1,29 @@
+# See orders-service/migration-job.yaml for the reasoning.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: inventory-migrate
+  namespace: service-health-dashboard
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - until pg_isready -h inventory-postgres -p 5432 -U inventory; do echo "waiting for inventory-postgres"; sleep 2; done
+      containers:
+        - name: migrate
+          image: inventory-service:local
+          imagePullPolicy: IfNotPresent
+          args: ["--migrate-only"]
+          env:
+            - name: Database__RunMigrationsOnStartup
+              value: "true"
+          envFrom:
+            - secretRef:
+                name: inventory-service-secret

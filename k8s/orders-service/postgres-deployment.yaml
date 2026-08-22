@@ -1,0 +1,51 @@
+# Deployment + PVC, not a StatefulSet: one replica, no need for stable network
+# identity or ordered scaling — a StatefulSet would only add ceremony here.
+# No operator (Zalando/CloudNativePG) either: that's the right call once there's
+# more than one environment to manage or HA/backups matter, not for a single
+# local dev instance.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-postgres
+  namespace: service-health-dashboard
+spec:
+  replicas: 1
+  strategy:
+    # A ReadWriteOnce PVC can only be mounted by one pod at a time — a rolling
+    # update would deadlock waiting for the old pod to release it while the new
+    # one waits to mount it. Recreate tears down the old pod first.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: orders-postgres
+  template:
+    metadata:
+      labels:
+        app: orders-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: orders-postgres-secret
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+              subPath: postgres
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "orders", "-d", "orders"]
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "orders", "-d", "orders"]
+            periodSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: orders-postgres-pvc

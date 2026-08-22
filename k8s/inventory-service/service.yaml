@@ -1,0 +1,15 @@
+# ClusterIP: internal only. orders-service reaches this at
+# http://inventory-service:8080 (see InventoryClient__BaseUrl in
+# orders-service/deployment.yaml) — nothing outside the cluster calls it directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory-service
+  namespace: service-health-dashboard
+spec:
+  type: ClusterIP
+  selector:
+    app: inventory-service
+  ports:
+    - port: 8080
+      targetPort: 8080

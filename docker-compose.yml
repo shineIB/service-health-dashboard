@@ -66,6 +66,24 @@ services:
       inventory-postgres:
         condition: service_healthy
 
+  dashboard-service:
+    build:
+      context: .
+      dockerfile: src/DashboardService/DashboardService.Api/Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-local}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    ports:
+      - "8082:8080"
+    environment:
+      MonitoredServices__Services__0__Name: "orders-service"
+      MonitoredServices__Services__0__BaseUrl: "http://orders-service:8080"
+      MonitoredServices__Services__1__Name: "inventory-service"
+      MonitoredServices__Services__1__BaseUrl: "http://inventory-service:8080"
+    depends_on:
+      - orders-service
+      - inventory-service
+
 volumes:
   orders-postgres-data:
   inventory-postgres-data:

@@ -1,0 +1,47 @@
+# Build context is the repo root (see docker-compose.yml) so this can restore
+# the whole DashboardService.Api -> Domain/Infrastructure project-reference graph
+# and reach the frontend under src/DashboardService/DashboardService.Web.
+
+FROM node:20-alpine AS frontend-build
+WORKDIR /web
+COPY src/DashboardService/DashboardService.Web/package.json src/DashboardService/DashboardService.Web/package-lock.json* ./
+RUN npm install
+COPY src/DashboardService/DashboardService.Web/ ./
+RUN npm run build
+
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+WORKDIR /src
+
+COPY Directory.Build.props .
+COPY src/DashboardService/DashboardService.Api/DashboardService.Api.csproj src/DashboardService/DashboardService.Api/
+COPY src/DashboardService/DashboardService.Domain/DashboardService.Domain.csproj src/DashboardService/DashboardService.Domain/
+COPY src/DashboardService/DashboardService.Infrastructure/DashboardService.Infrastructure.csproj src/DashboardService/DashboardService.Infrastructure/
+RUN dotnet restore src/DashboardService/DashboardService.Api/DashboardService.Api.csproj
+
+COPY src/DashboardService/DashboardService.Api/ src/DashboardService/DashboardService.Api/
+COPY src/DashboardService/DashboardService.Domain/ src/DashboardService/DashboardService.Domain/
+COPY src/DashboardService/DashboardService.Infrastructure/ src/DashboardService/DashboardService.Infrastructure/
+RUN dotnet publish src/DashboardService/DashboardService.Api/DashboardService.Api.csproj \
+    -c Release -o /app --no-restore
+
+FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime
+WORKDIR /app
+
+# Passed by docker-compose / CI (`docker build --build-arg GIT_SHA=$(git rev-parse HEAD) ...`).
+# Not build-cache keys on purpose: they change every commit, and busting the
+# build-layer cache for that would slow down every rebuild for no benefit.
+ARG GIT_SHA=unknown
+ARG BUILD_TIME=unknown
+
+ENV Build__GitSha=$GIT_SHA \
+    Build__BuildTimeUtc=$BUILD_TIME \
+    ASPNETCORE_URLS=http://+:8080 \
+    ASPNETCORE_ENVIRONMENT=Production
+
+COPY --from=build /app .
+COPY --from=frontend-build /web/dist ./wwwroot
+
+USER $APP_UID
+EXPOSE 8080
+
+ENTRYPOINT ["dotnet", "DashboardService.Api.dll"]

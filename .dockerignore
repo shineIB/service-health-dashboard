@@ -6,3 +6,6 @@
 .gitignore
 *.md
 tests/
+**/node_modules/
+**/dist/
+**/wwwroot/

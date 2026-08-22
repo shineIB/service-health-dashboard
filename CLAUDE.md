@@ -334,6 +334,110 @@ Helm — som planerat.
    korrekt `available: 6, reserved: 4` (3 från innan + 1 ny) — full
    återhämtning utan manuell inblandning.
 
-Nästa steg: steg 5 — dashboard. Ett aggregerings-API som frågar varje tjänsts
-`/health/*` och `/version`, plus en frontend som visar status, version och
-senaste deploy per tjänst.
+## Steg 5 — dashboard. Klart och verifierat.
+
+`dashboard-service` tillkommen i `src/DashboardService/` (`Api` / `Domain` /
+`Infrastructure`, samma mönster som de andra) + `DashboardService.Web/`
+(React + Vite + TypeScript). Ingen egen databas.
+
+**Beslut (redan fattade, dokumenteras här):**
+
+- **Config-driven tjänstelista, inte k8s-native discovery.** Vilka tjänster
+  som övervakas (namn + bas-URL) kommer från en typad options-klass
+  (`MonitoredServicesOptions`), bunden från config — i k8s via indexerade
+  env-vars (`MonitoredServices__Services__0__Name` osv.) på samma sätt som
+  övriga tjänsters config. **Naturligt nästa steg:** hämta tjänstelistan från
+  k8s API:et (t.ex. genom att lista Services/Pods med en label-selector)
+  istället för att hårdkoda den i Deployment-manifestet — inte gjort nu för
+  att hålla steget litet, men den självklara vägen när fler tjänster tillkommer.
+- **Bakgrundspoller, inte fan-out per request.** `ServiceHealthPollingService`
+  (`BackgroundService`) pollar varje övervakad tjänst var 5:e sekund
+  (`Polling:IntervalSeconds`) och skriver till en delad in-memory-cache
+  (`IServiceHealthCache`, `ConcurrentDictionary`). `GET /api/services` läser
+  *bara* cachen — anropar aldrig ut mot en övervakad tjänst. Utan den här
+  separationen hade belastningen på orders-service/inventory-service skalat
+  med antalet öppna dashboard-flikar, ett självförvållat DoS mot ens egna
+  tjänster.
+- **dashboard-apis egen readiness kan aldrig spegla en övervakad tjänsts
+  status — arkitektoniskt, inte bara genom en regel.** `Program.cs` kallar
+  `AddHealthChecks()` utan att lägga till några checks alls: dashboard-api har
+  ingen egen databas eller något annat internt beroende, så det finns inget i
+  hälsokontrollpipelinen som ens *kan* fråga `IServiceHealthCache`. `/health/live`
+  och `/health/ready` blir därför identiska här (medvetet — det finns inget
+  beroende att skilja dem på). Låst fast av
+  `HealthEndpointTests.Ready_ReturnsHealthy_EvenWhenEveryMonitoredServiceIsDown`,
+  som seedar cachen med en `Unreachable`- och en `Unhealthy`-post och verifierar
+  att `/health/ready` ändå svarar 200.
+- **Unhealthy vs. Unreachable, kort per-tjänst-timeout, isolerat per tjänst.**
+  `ServiceHealthChecker` (utbruten från polling-loopen just för att vara
+  direkt testbar utan en riktig `BackgroundService`) anropar `/health/ready`
+  med ett ~2s tidsbudget (`Polling:PerServiceTimeoutSeconds`) per tjänst:
+  - Svar men icke-2xx → `Unhealthy` ("den mår dåligt, men den svarade").
+  - Inget svar alls (timeout, connection refused, DNS-fel) → `Unreachable`
+    ("den finns inte där just nu").
+  - Varje tjänst pollas som en egen `Task` i `Task.WhenAll` — en långsam eller
+    onåbar tjänst fördröjer aldrig de andras uppdatering.
+  - `/version` hämtas best-effort på samma tidsbudget efter ett lyckat
+    `/health/ready`-svar; misslyckas det anropet ensamt nedgraderas inte
+    statusen, gammal version-info (om någon) behålls bara.
+  - Vid `Unreachable` behålls `LastSuccessfulCheckUtc` och version-fälten från
+    föregående snapshot istället för att nollställas — en tjänst som går ner
+    ska inte radera det senast kända goda tillståndet.
+- **Frontend:** React + Vite + TypeScript, pollar `/api/services` var 5:e
+  sekund (samma intervall som backend-pollningen — ingen anledning att polla
+  snabbare än datan faktiskt ändras). Ingen SSE/WebSocket än — **möjlig
+  uppgradering** när polling-overheaden eller latenskraven motiverar det.
+  Byggs till statiska filer (`npm run build` → `dist/`) som kopieras in i
+  `DashboardService.Api`s `wwwroot/` vid Docker-bygget och serveras av
+  dashboard-api självt (`UseDefaultFiles`/`UseStaticFiles`/`MapFallbackToFile`)
+  — samma origin som API:et, alltså ingen CORS och ingen extra k8s-podd bara
+  för frontend.
+- **"Senaste deploy"** visas som `buildTimeUtc` från varje tjänsts `/version`
+  (byggtiden bakas in vid `docker build --build-arg BUILD_TIME=...`, se
+  Dockerfiles). **Notera:** det är byggtid, inte deploy-tid — en riktig
+  deploy-tidsstämpel (när podden faktiskt rullades ut) skulle kräva att fråga
+  k8s API:et (Deployment/ReplicaSet-events), inte bara tjänsten själv. Samma
+  "nästa steg mot k8s-native"-linje som tjänstelistan ovan.
+- **Ingen UI-polish** i det här steget, som avtalat — ren tabell, inga
+  färgteman/typsnitt/layout-arbete. Prioriteten var att få data att flöda
+  korrekt genom hela kedjan (poller → cache → API → frontend) innan något
+  annat.
+
+**Testtäckning:** `ServiceHealthCheckerTests` (Healthy/Unhealthy/Unreachable-
+klassificering, version-fel nedgraderar inte status, timeout begränsar hur
+länge en långsam tjänst får ta, `Unreachable` bevarar föregående snapshots
+version/`LastSuccessfulCheckUtc`) — allt med en fejkad `HttpMessageHandler`,
+ingen riktig HTTP. `InMemoryServiceHealthCacheTests` (grundläggande cache-
+beteende). `HealthEndpointTests` (se ovan — den låsande testen).
+`DashboardEndpointsTests` (`/api/services` speglar cachen korrekt, inkl.
+`Unreachable`-fallet). Alla 66 tester i lösningen (orders + inventory +
+dashboard) gröna.
+
+**Verifierat på riktigt i minikube** (samma kluster som steg 4, ingen omstart
+behövdes):
+
+1. `npm run build` (Vite) verifierat separat, sedan `docker build` (Node-steg
+   → dotnet-steg → runtime som kopierar in båda) + `minikube image load` +
+   `kubectl apply` för `dashboard-service` (Deployment + NodePort-Service,
+   inget nytt Postgres/Secret/Job). Rullade ut rent, `1/1 Ready` direkt.
+2. Nådde dashboard-service utifrån klustret via `minikube service
+   dashboard-service -n service-health-dashboard --url`. `/api/services`
+   visade båda tjänsterna som `Healthy` med korrekt version/gitSha/
+   svarstid inom en pollningscykel.
+3. `kubectl scale deployment/inventory-service --replicas=0`. Nästa
+   pollningscykel: `inventory-service` gick till `Unreachable`
+   (`responseTimeMs: null`, felmeddelande "Connection refused"), medan
+   `orders-service` fortsatte rapportera `Healthy` med uppdaterad
+   `lastSuccessfulCheckUtc` — bekräftar isoleringen mellan tjänster på
+   riktigt, inte bara i test. `dashboard-service`s egen pod förblev
+   `1/1 Ready`, `Restart Count: 0`, och `/health/live` + `/health/ready`
+   svarade 200 hela tiden.
+4. `kubectl scale deployment/inventory-service --replicas=1`. Nästa
+   pollningscykel: `inventory-service` tillbaka som `Healthy` med färsk
+   `lastSuccessfulCheckUtc` — full återhämtning utan manuell inblandning,
+   samma mönster som orders/inventory-verifieringen i steg 4.
+
+Nästa steg: observability (steg 6) — OpenTelemetry, strukturerad loggning,
+ev. Prometheus + Grafana. Möjliga uppgraderingar noterade ovan (k8s-native
+service discovery för dashboard, SSE/WebSocket istället för polling, riktig
+deploy-tid via k8s API:et) är inte bortglömda, bara medvetet uppskjutna.

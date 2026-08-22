@@ -1,0 +1,60 @@
+# No Secret, no PVC, no migration Job: dashboard-service has no database of its own —
+# it only polls the other two services' /health/ready and /version over HTTP.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard-service
+  namespace: service-health-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dashboard-service
+  template:
+    metadata:
+      labels:
+        app: dashboard-service
+    spec:
+      containers:
+        - name: dashboard-service
+          image: dashboard-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            # Config-driven list of what to monitor (name + base URL), not hardcoded and
+            # not from the k8s API yet — see CLAUDE.md for why k8s-native service
+            # discovery is the natural next step here, not this iteration.
+            - name: MonitoredServices__Services__0__Name
+              value: "orders-service"
+            - name: MonitoredServices__Services__0__BaseUrl
+              value: "http://orders-service:8080"
+            - name: MonitoredServices__Services__1__Name
+              value: "inventory-service"
+            - name: MonitoredServices__Services__1__BaseUrl
+              value: "http://inventory-service:8080"
+          # Same reasoning as orders-service/inventory-service's probes (see
+          # orders-service/deployment.yaml) — same app shape, same budget. dashboard-api's
+          # /health/live and /health/ready are identical here (no dependency of its own to
+          # distinguish them by), which is deliberate: see the AddHealthChecks() comment
+          # in Program.cs.
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            periodSeconds: 2
+            failureThreshold: 15
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3

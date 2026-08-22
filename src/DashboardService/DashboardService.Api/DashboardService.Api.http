@@ -1,0 +1,21 @@
+@DashboardService.Api_HostAddress = http://localhost:5040
+
+GET {{DashboardService.Api_HostAddress}}/health/live
+Accept: application/json
+
+###
+
+GET {{DashboardService.Api_HostAddress}}/health/ready
+Accept: application/json
+
+###
+
+GET {{DashboardService.Api_HostAddress}}/version
+Accept: application/json
+
+###
+
+GET {{DashboardService.Api_HostAddress}}/api/services
+Accept: application/json
+
+###

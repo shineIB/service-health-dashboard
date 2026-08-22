@@ -15,10 +15,14 @@ out/
 coverage/
 *.trx
 
-## Node (dashboard frontend, senare)
+## Node (dashboard frontend)
 node_modules/
 dist/
 .vite/
+*.tsbuildinfo
+
+## Generated: Vite build output copied into DashboardService.Api for static serving
+src/DashboardService/DashboardService.Api/wwwroot/
 
 ## Env / secrets
 .env

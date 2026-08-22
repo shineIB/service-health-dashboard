@@ -1,0 +1,15 @@
+# NodePort, same as orders-service/service.yaml: this is the other service meant to be
+# reached from outside the cluster, via `minikube service dashboard-service -n
+# service-health-dashboard`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard-service
+  namespace: service-health-dashboard
+spec:
+  type: NodePort
+  selector:
+    app: dashboard-service
+  ports:
+    - port: 8080
+      targetPort: 8080

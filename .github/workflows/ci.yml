@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Restore
+        run: dotnet restore ServiceHealthDashboard.sln
+
+      - name: Build
+        run: dotnet build ServiceHealthDashboard.sln --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test ServiceHealthDashboard.sln --configuration Release --no-build
+
+  docker-build:
+    name: Docker build (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    strategy:
+      matrix:
+        include:
+          - service: orders-service
+            dockerfile: src/OrdersService/OrdersService.Api/Dockerfile
+          - service: inventory-service
+            dockerfile: src/InventoryService/InventoryService.Api/Dockerfile
+          - service: dashboard-service
+            dockerfile: src/DashboardService/DashboardService.Api/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build only — not pushed anywhere yet. This just catches a broken
+      # Dockerfile (missing COPY path, failed npm/dotnet build inside the
+      # image, etc.) on every push/PR, same as the test job catches broken code.
+      - name: Build ${{ matrix.service }} image
+        run: |
+          docker build \
+            -f ${{ matrix.dockerfile }} \
+            -t ${{ matrix.service }}:ci \
+            .

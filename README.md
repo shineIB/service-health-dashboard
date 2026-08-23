@@ -1,5 +1,7 @@
 # Service Health & Deployment Dashboard
 
+[![CI](https://github.com/shineIB/service-health-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/shineIB/service-health-dashboard/actions/workflows/ci.yml)
+
 A small e-commerce backend built to demonstrate *running* a microservice system, not just writing one. Two .NET services — orders and inventory — coordinate over HTTP with real failure handling (timeouts, retries, circuit breaking, idempotency), run in Kubernetes, and are watched by a third service that reports their live health, version, and deploy info without ever depending on them staying up.
 
 ## Architecture
@@ -87,6 +89,33 @@ kubectl -n service-health-dashboard rollout status deployment/dashboard-service
 # and needs its terminal left open for the tunnel to stay up
 minikube service dashboard-service -n service-health-dashboard
 ```
+
+### Troubleshooting: `minikube image load` silently keeping a stale image
+
+All three images are tagged with a fixed tag (`:local`), not a per-build tag
+like a git SHA — deliberate for a local dev loop, but it has a sharp edge:
+after you rebuild an image (`docker build -t orders-service:local ...`) and
+run `minikube image load orders-service:local` again, the node can keep
+serving the *old* image contents under that same tag. Combined with
+`imagePullPolicy: IfNotPresent` on every Deployment (see "Images" in
+`CLAUDE.md`), kubelet sees a tag it already has and never re-pulls — a
+`kubectl rollout restart` just restarts pods running your old code, and the
+symptom looks like your code change "didn't take" even though the rollout
+reports success.
+
+The fix is to remove the tag from the node before reloading, not just
+rebuild it:
+
+```bash
+minikube image rm orders-service:local
+minikube image load orders-service:local
+kubectl -n service-health-dashboard rollout restart deployment/orders-service
+```
+
+If you're not sure whether the node is actually holding a stale image,
+`minikube image ls` lists what the node currently has — compare its age/ID
+there against your local `docker images` before spending time debugging the
+application itself.
 
 ## The dashboard
 

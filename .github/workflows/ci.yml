@@ -10,6 +10,40 @@ jobs:
   build-and-test:
     name: Build & test
     runs-on: ubuntu-latest
+    # orders-service.Api.Tests / InventoryService.Api.Tests use WebApplicationFactory<Program>
+    # with startup migrations disabled (see OrdersApiFactory / InventoryApiFactory) but keep
+    # each service's real appsettings.json connection string — so they need a real, already
+    # migrated Postgres reachable on localhost, matching docker-compose's ports/credentials
+    # exactly. Two service containers stand in for that; the migrate steps below apply the
+    # schema once before the tests run, the same one-shot-migration approach used by the
+    # k8s Jobs (see CLAUDE.md) rather than letting the app migrate on every startup.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: orders
+          POSTGRES_USER: orders
+          POSTGRES_PASSWORD: orders
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orders -d orders"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      inventory-postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: inventory
+          POSTGRES_USER: inventory
+          POSTGRES_PASSWORD: inventory
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U inventory -d inventory"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -23,6 +57,16 @@ jobs:
 
       - name: Build
         run: dotnet build ServiceHealthDashboard.sln --configuration Release --no-restore
+
+      - name: Apply orders-service migrations
+        run: dotnet src/OrdersService/OrdersService.Api/bin/Release/net9.0/OrdersService.Api.dll --migrate-only
+        env:
+          Database__RunMigrationsOnStartup: "true"
+
+      - name: Apply inventory-service migrations
+        run: dotnet src/InventoryService/InventoryService.Api/bin/Release/net9.0/InventoryService.Api.dll --migrate-only
+        env:
+          Database__RunMigrationsOnStartup: "true"
 
       - name: Test
         run: dotnet test ServiceHealthDashboard.sln --configuration Release --no-build

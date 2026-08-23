@@ -441,3 +441,50 @@ Nästa steg: observability (steg 6) — OpenTelemetry, strukturerad loggning,
 ev. Prometheus + Grafana. Möjliga uppgraderingar noterade ovan (k8s-native
 service discovery för dashboard, SSE/WebSocket istället för polling, riktig
 deploy-tid via k8s API:et) är inte bortglömda, bara medvetet uppskjutna.
+
+## Steg 8, CI-delen — klart och verifierat (CD kommer senare).
+
+`.github/workflows/ci.yml`: körs på varje push och PR mot `master`.
+
+- **`build-and-test`:** `dotnet restore`/`build`/`test` mot hela `.sln`.
+- **`docker-build`** (matrix, `needs: build-and-test`): bygger alla tre
+  service-images (`docker build -f <Dockerfile> .`, repo-root som context,
+  samma som lokalt) för att fånga en trasig Dockerfile tidigt. Pushar inget
+  någonstans än — det är CD, inte det här steget.
+- Statusbadge överst i README, länkad till workflow-sidan.
+
+**Upptäckt under verifiering — testsviten var inte lika isolerad som
+kommentarerna i den påstod.** `OrdersApiFactory`/`InventoryApiFactory`
+(`WebApplicationFactory`-baserade) stänger av startup-migrationer men
+använder annars tjänstens riktiga `appsettings.json`, inklusive den riktiga
+Postgres-anslutningssträngen (`localhost:5432`/`5433`, samma som
+docker-compose). Lokalt gick det ändå grönt eftersom en tidigare
+`docker compose up`-körning hade lämnat kvar en migrerad Postgres-volym på
+de portarna — testerna var alltså aldrig riktigt fristående, de råkade bara
+alltid ha en riktig databas liggandes. Första CI-körningen (ingen Postgres
+alls på `ubuntu-latest`-runnern) exponerade det direkt: alla endpoints som
+rör databasen svarade 500.
+
+**Beslut — Postgres-tjänstecontainrar + en migrate-only-körning i CI,
+inte omskrivna tester.** Att göra testerna verkligt fristående (fejkade
+repositories eller Testcontainers) är en större omskrivning av testsviten,
+inte en del av "dra fram CI". Istället matchar workflowen vad testerna redan
+antar: två `services:`-Postgres-containrar (samma portar/credentials som
+docker-compose), och innan `dotnet test` körs samma `--migrate-only`-läge
+som redan finns för k8s-Jobben (se steg 4) en gång per tjänst — samma
+"migrera en gång, inte per körning/replik"-princip som redan var beslutad,
+återanvänd rakt av. `Database__RunMigrationsOnStartup=true` sätts bara på de
+två migrate-stegen (per-step `env:`, läcker inte in i `dotnet test`-steget),
+så själva testkörningen är oförändrad — bara databasen den pratar med finns
+nu på riktigt.
+**Kvarstående, medvetet inte åtgärdat nu:** kommentaren i
+`OrdersApiFactory`/`InventoryApiFactory` ("No real Postgres is available...")
+stämmer inte längre i CI och var aldrig helt sann lokalt heller — värt att
+städa upp eller (bättre) faktiskt göra testerna DB-fria när den här typen av
+tester utökas, men inte gjort nu för att hålla CI-steget litet.
+**Verifierat på riktigt:** `gh run watch` på faktiska GitHub Actions-körningar
+(inte lokalt) — första körningen röd (bekräftade ovanstående gap), andra
+körningen grön efter fixet, alla 66 tester + alla tre Docker-images.
+Reproducerat och verifierat samma fix lokalt också: startade två
+`postgres:16-alpine`-containrar på 5432/5433, körde `--migrate-only` mot
+dem, körde `dotnet test` — samma 66/66 gröna.

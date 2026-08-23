@@ -684,3 +684,40 @@ inte bara kod som kompilerar):
 
 Nästa steg: steg 6 del 2 (metrics — OpenTelemetry-mätvärden, ev.
 Prometheus/Grafana), sedan steg 7 (tredje tjänsten + meddelandebuss).
+
+## Uppföljning — dashboard visade `@unknown` istället för git-SHA
+
+Upptäckt i en ny session vid en vanlig statuskoll av dashboarden i minikube
+(inte under en verifieringsgenomgång av ett steg): `version`-kolumnen visade
+`0.1.0-dev @unknown` för båda tjänsterna istället för en riktig `gitSha`.
+
+**Grundorsak:** ingen kodbugg — Dockerfiles har redan `ARG GIT_SHA=unknown`/
+`ARG BUILD_TIME=unknown` med korrekt fallback, och docker-compose-flödet
+skickar redan med dem via env-var-substitution (`${GIT_SHA:-local}`). Men
+README:s dokumenterade minikube-bygg-kommandon (`docker build -t
+orders-service:local -f ... .`) skickade aldrig med `--build-arg
+GIT_SHA=... --build-arg BUILD_TIME=...` — de körda images i klustret hade
+alltså faktiskt aldrig fått något annat än default-värdet, inte en regression
+i koden.
+
+**Fix:** README:s minikube-byggsteg beräknar nu `GIT_SHA`/`BUILD_TIME` och
+skickar dem som `--build-arg` till alla tre `docker build`-kommandon.
+
+**Sidoupptäckt under ombygget — `minikube image rm` kan faila tyst-ish när
+en pod fortfarande kör imagen.** Att bygga om och köra `minikube image rm`
++ `image load` (det redan dokumenterade mönstret för stale-tag-problemet)
+utan att först skala ner Deploymentsen gav `conflict: ... (must force) -
+container ... is using its referenced image ...` på alla tre — poddarna
+höll fortfarande i de gamla image-ID:na. `image load` hade i så fall
+fortsatt tyst servera det gamla innehållet under samma tagg. Löst genom att
+skala ner de tre app-Deploymentsen till 0 innan `image rm`/`image load`,
+sedan skala upp igen — samma grundmönster som redan var känt (se steg 6
+ovan, punkt 1 i minikube-image-load-fällan), bara inte tidigare
+dokumenterat som ett eget steg. README:s troubleshooting-avsnitt är
+uppdaterat med den här varianten.
+
+**Verifierat:** `docker run --rm --entrypoint printenv <image> | grep
+Build__` mot de nybyggda images innan de laddades in (bekräftade
+`Build__GitSha=6f310da`/`Build__BuildTimeUtc=...` bakade in korrekt), sedan
+full omdeploy i minikube och `/api/services` samt dashboarden i webbläsaren
+— visade `0.1.0-dev @6f310da` för båda tjänsterna efter fixet.

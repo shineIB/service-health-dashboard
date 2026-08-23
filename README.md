@@ -49,9 +49,13 @@ Everything lives in the `service-health-dashboard` namespace — pass `-n servic
 
 ```bash
 # Build and load the three images (no external registry)
-docker build -t orders-service:local    -f src/OrdersService/OrdersService.Api/Dockerfile .
-docker build -t inventory-service:local -f src/InventoryService/InventoryService.Api/Dockerfile .
-docker build -t dashboard-service:local -f src/DashboardService/DashboardService.Api/Dockerfile .
+# GIT_SHA/BUILD_TIME are baked in as build args so the dashboard's "version"
+# column shows something other than "unknown" — see Dockerfile comments.
+GIT_SHA=$(git rev-parse --short HEAD)
+BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+docker build -t orders-service:local    -f src/OrdersService/OrdersService.Api/Dockerfile    --build-arg GIT_SHA=$GIT_SHA --build-arg BUILD_TIME=$BUILD_TIME .
+docker build -t inventory-service:local -f src/InventoryService/InventoryService.Api/Dockerfile --build-arg GIT_SHA=$GIT_SHA --build-arg BUILD_TIME=$BUILD_TIME .
+docker build -t dashboard-service:local -f src/DashboardService/DashboardService.Api/Dockerfile --build-arg GIT_SHA=$GIT_SHA --build-arg BUILD_TIME=$BUILD_TIME .
 
 minikube start
 minikube image load orders-service:local
@@ -118,6 +122,21 @@ rebuild it:
 minikube image rm orders-service:local
 minikube image load orders-service:local
 kubectl -n service-health-dashboard rollout restart deployment/orders-service
+```
+
+If `minikube image rm` fails with `conflict: unable to remove repository
+reference "...:local" (must force) - container ... is using its referenced
+image ...`, a running pod is still holding that image — `image rm` silently
+does nothing useful in that case, and the subsequent `image load` keeps
+serving the stale content even though it reports success. Scale the
+Deployment to 0 first so nothing on the node references the old image, then
+rm/load/scale back up:
+
+```bash
+kubectl -n service-health-dashboard scale deployment/orders-service --replicas=0
+minikube image rm orders-service:local
+minikube image load orders-service:local
+kubectl -n service-health-dashboard scale deployment/orders-service --replicas=1
 ```
 
 If you're not sure whether the node is actually holding a stale image,

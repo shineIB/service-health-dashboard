@@ -8,13 +8,21 @@ using OrdersService.Domain;
 
 namespace OrdersService.Api.Tests;
 
-// No real Postgres is available for these WebApplicationFactory-based tests, so startup
-// migrations must be disabled here. Testcontainers-based integration tests (step 2) will
-// cover the real migration/DB path. IInventoryClient is replaced with a fake for the same
-// reason: no real inventory-service is running for these tests either.
+// Connection string comes from PostgresContainerFixture (a real Testcontainers Postgres,
+// shared per collection), not from appsettings.json. Startup migrations stay disabled —
+// the fixture already applied them once before any test in the collection runs.
+// IInventoryClient is still replaced with a fake: no real inventory-service runs for these
+// tests, only its own database is real.
 public class OrdersApiFactory : WebApplicationFactory<Program>
 {
+    private readonly string _connectionString;
+
     public FakeInventoryClient InventoryClient { get; } = new();
+
+    public OrdersApiFactory(PostgresContainerFixture postgres)
+    {
+        _connectionString = postgres.ConnectionString;
+    }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
@@ -22,7 +30,8 @@ public class OrdersApiFactory : WebApplicationFactory<Program>
         {
             config.AddInMemoryCollection(new Dictionary<string, string?>
             {
-                ["Database:RunMigrationsOnStartup"] = "false"
+                ["Database:RunMigrationsOnStartup"] = "false",
+                ["Infrastructure:ConnectionString"] = _connectionString
             });
         });
 

@@ -7,6 +7,7 @@ using Xunit;
 
 namespace OrdersService.Api.Tests;
 
+[Collection(OrdersApiCollection.Name)]
 public class VersionEndpointTests : IClassFixture<OrdersApiFactory>
 {
     private readonly OrdersApiFactory _factory;

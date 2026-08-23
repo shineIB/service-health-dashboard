@@ -488,3 +488,56 @@ körningen grön efter fixet, alla 66 tester + alla tre Docker-images.
 Reproducerat och verifierat samma fix lokalt också: startade två
 `postgres:16-alpine`-containrar på 5432/5433, körde `--migrate-only` mot
 dem, körde `dotnet test` — samma 66/66 gröna.
+
+### Uppföljning — service containers ersatta med Testcontainers
+
+Ovanstående "kvarstående, medvetet inte åtgärdat nu"-punkt åtgärdades samma
+dag. Service containers + `--migrate-only` i workflowen var ett medvetet
+litet första steg (se ovan: "inte en del av 'dra fram CI'") — inte en
+felbedömning, bara nästa steg i kön. Historiken står kvar ovan för att visa
+att gapet var känt och stängt i två steg, inte att det aldrig fanns.
+
+**Vad som ändrades:** `OrdersApiFactory`/`InventoryApiFactory` startar nu var
+sin `PostgreSqlContainer` (Testcontainers.PostgreSql) via en delad
+`PostgresContainerFixture : IAsyncLifetime` och skriver över
+`Infrastructure:ConnectionString` i stället för att läsa tjänstens
+`appsettings.json`. Fixturen kör `Database.MigrateAsync()` mot containern
+som en del av `InitializeAsync()`, innan något test körs. Delad **per
+test-collection** (`[CollectionDefinition]` + `ICollectionFixture<PostgresContainerFixture>`,
+alla testklasser i respektive projekt taggade `[Collection(...)]`) — en
+container per projekt, inte en per testklass. `ReservationExpiryFactory`
+(egen TTL/sweep-konfiguration) tar samma `PostgresContainerFixture` som
+konstruktorparameter och delar alltså container med resten av collectionen,
+bara med annan app-konfiguration ovanpå. `ci.yml` tappade båda
+Postgres-`services:`-blocken och båda `--migrate-only`-stegen — workflowen
+behöver inte längre veta att tjänsterna använder en databas alls, bara att
+Docker finns (vilket `ubuntu-latest` redan har).
+
+**Upptäckt under omskrivningen — ännu ett dolt gap, av samma familj som
+ovan.** Att bara skriva över `Infrastructure:ConnectionString` via
+`WebApplicationFactory.ConfigureWebHost`/`ConfigureAppConfiguration` räckte
+inte: `AddOrdersInfrastructure`/`AddInventoryInfrastructure` läste
+anslutningssträngen från `builder.Configuration` (parametern som skickas in
+vid `builder.Services.AddOrdersInfrastructure(builder.Configuration)` i
+`Program.cs`, **före** `builder.Build()`), och `WebApplicationFactory`s
+konfigurationsöverskrivningar landar bara i den färdigbyggda
+konfigurationen — exakt samma fälla som redan var dokumenterad i
+`Program.cs` för `Database:RunMigrationsOnStartup` ("Read via
+app.Configuration (post-Build), not builder.Configuration"). Testerna körde
+alltså tyst mot porten från `appsettings.json` (5432/5433) istället för
+containerns riktiga, slumpmässiga port — märktes bara för att docker-compose
+var nedstängt när det begav sig, annars hade det varit samma typ av
+falsk-grön-av-tur som orsakade förra gapet.
+**Fix:** `AddDbContext<OrdersDbContext>`/`AddDbContext<InventoryDbContext>`
+läser nu anslutningssträngen lazy, via `IConfiguration` upplöst från
+`IServiceProvider` inne i options-delegaten (`(serviceProvider, builder) =>
+...`) istället för att fånga värdet vid registreringstillfället. Detta
+körs vid första faktiska DB-anropet (efter `Build()`), samma timing som
+redan fungerade för migrationsflaggan — inte en specialregel för tester,
+utan att sluta läsa konfiguration för tidigt, generellt.
+**Verifierat:** `docker compose down` (bekräftat nere, ingenting på
+5432/5433), `dotnet test` mot hela lösningen — 66/66 gröna, ingen lokal
+Postgres krävd. Bekräftat att exakt en Postgres-container (plus
+Testcontainers egen Ryuk-reaper) skapas per testprojekt, inte en per
+testklass. `gh run watch` på den bantade workflowen — grön, alla tre
+Docker-images också gröna.

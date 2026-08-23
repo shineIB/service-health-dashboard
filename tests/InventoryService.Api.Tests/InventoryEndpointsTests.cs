@@ -8,6 +8,7 @@ using Xunit;
 
 namespace InventoryService.Api.Tests;
 
+[Collection(InventoryApiCollection.Name)]
 public class InventoryEndpointsTests : IClassFixture<InventoryApiFactory>
 {
     private readonly InventoryApiFactory _factory;

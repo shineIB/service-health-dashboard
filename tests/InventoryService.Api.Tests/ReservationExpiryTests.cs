@@ -5,6 +5,7 @@ using Xunit;
 
 namespace InventoryService.Api.Tests;
 
+[Collection(InventoryApiCollection.Name)]
 public class ReservationExpiryTests : IClassFixture<ReservationExpiryFactory>
 {
     private readonly ReservationExpiryFactory _factory;

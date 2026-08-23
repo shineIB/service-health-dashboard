@@ -5,6 +5,7 @@ using Xunit;
 
 namespace OrdersService.Api.Tests;
 
+[Collection(OrdersApiCollection.Name)]
 public class HealthEndpointTests : IClassFixture<OrdersApiFactory>
 {
     private readonly OrdersApiFactory _factory;

@@ -81,6 +81,11 @@ public static class InventoryEndpoints
         var ttl = TimeSpan.FromSeconds(reservationOptions.Value.TtlSeconds);
         item.Reserve(request.OrderId, request.Quantity, ttl, timeProvider.GetUtcNow());
         await repository.SaveChangesAsync(cancellationToken);
+
+        // Insufficient-stock rejections are counted centrally in DomainExceptionHandler,
+        // since item.Reserve throws (and never reaches this line) in that case.
+        InventoryTelemetry.ReservationsSucceeded.Add(1);
+
         return TypedResults.Ok(InventoryItemResponse.FromDomain(item));
     }
 
@@ -100,6 +105,9 @@ public static class InventoryEndpoints
 
         item.Release(request.OrderId);
         await repository.SaveChangesAsync(cancellationToken);
+
+        InventoryTelemetry.Releases.Add(1);
+
         return TypedResults.Ok(InventoryItemResponse.FromDomain(item));
     }
 }

@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.EntityFrameworkCore;
+using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using InventoryService.Api;
@@ -45,7 +46,16 @@ builder.Services.AddOpenTelemetry()
         .AddSource(InventoryTelemetry.ActivitySourceName)
         // Defaults to http://localhost:4317; overridden via OTEL_EXPORTER_OTLP_ENDPOINT
         // (see k8s/jaeger and docker-compose.yml) — the OTel SDK reads that env var itself.
-        .AddOtlpExporter());
+        .AddOtlpExporter())
+    .WithMetrics(metrics => metrics
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation()
+        // inventory.reservations.succeeded/.failed, inventory.releases — see InventoryTelemetry.
+        .AddMeter(InventoryTelemetry.MeterName)
+        // Pull-based, not OTLP push: Jaeger only understands traces, and there's no
+        // Prometheus/Grafana deployed yet to receive a push either (see CLAUDE.md, step 6
+        // part 2). Scraped at GET /metrics until that infra exists.
+        .AddPrometheusExporter());
 
 var app = builder.Build();
 
@@ -88,6 +98,7 @@ app.UseHttpsRedirection();
 
 app.MapGroup("/inventory").MapInventoryEndpoints();
 app.MapVersionEndpoint();
+app.MapPrometheusScrapingEndpoint();
 
 app.MapHealthChecks("/health/live", new HealthCheckOptions
 {

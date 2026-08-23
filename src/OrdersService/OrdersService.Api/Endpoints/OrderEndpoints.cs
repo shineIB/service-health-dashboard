@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.Extensions.Logging;
 using OrdersService.Api.Contracts;
+using OrdersService.Api.Telemetry;
 using OrdersService.Domain;
 
 namespace OrdersService.Api.Endpoints;
@@ -51,6 +52,7 @@ public static class OrderEndpoints
             switch (result.Outcome)
             {
                 case ReserveStockOutcome.Unavailable:
+                    OrdersTelemetry.OrdersRejected.Add(1, new KeyValuePair<string, object?>("reason", "inventory_unavailable"));
                     httpContext.Response.Headers.RetryAfter = "5";
                     return TypedResults.Problem(
                         detail: result.Message ?? "inventory-service is unavailable.",
@@ -58,6 +60,7 @@ public static class OrderEndpoints
                         title: "Inventory temporarily unavailable.");
 
                 case ReserveStockOutcome.InsufficientStock:
+                    OrdersTelemetry.OrdersRejected.Add(1, new KeyValuePair<string, object?>("reason", "insufficient_stock"));
                     return TypedResults.Problem(
                         detail: result.Message ?? $"Insufficient stock for product {line.ProductId}.",
                         statusCode: StatusCodes.Status409Conflict,
@@ -67,6 +70,8 @@ public static class OrderEndpoints
 
         await repository.AddAsync(order, cancellationToken);
         await repository.SaveChangesAsync(cancellationToken);
+
+        OrdersTelemetry.OrdersCreated.Add(1);
 
         var response = OrderResponse.FromDomain(order);
         return TypedResults.Created($"/orders/{order.Id}", response);
@@ -118,6 +123,8 @@ public static class OrderEndpoints
 
         order.Cancel();
         await repository.SaveChangesAsync(cancellationToken);
+
+        OrdersTelemetry.OrdersCancelled.Add(1);
 
         // The cancellation itself is already committed above: releasing the reservation
         // is a best-effort side effect, not a precondition. If it fails, the order stays

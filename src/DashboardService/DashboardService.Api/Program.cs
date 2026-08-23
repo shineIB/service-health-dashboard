@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
+using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using DashboardService.Api.Configuration;
@@ -40,7 +41,17 @@ builder.Services.AddOpenTelemetry()
         .SetSampler(new AlwaysOnSampler())
         .AddAspNetCoreInstrumentation()
         .AddHttpClientInstrumentation()
-        .AddOtlpExporter());
+        .AddOtlpExporter())
+    // No custom Meter here (unlike orders/inventory) — dashboard-service has no domain
+    // outcomes of its own to count yet; ServiceHealthPollingService's own success/failure
+    // rate is a natural next metric, not added now to keep this step to auto-instrumentation.
+    .WithMetrics(metrics => metrics
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation()
+        // Pull-based, not OTLP push: Jaeger only understands traces, and there's no
+        // Prometheus/Grafana deployed yet to receive a push either (see CLAUDE.md, step 6
+        // part 2). Scraped at GET /metrics until that infra exists.
+        .AddPrometheusExporter());
 
 var app = builder.Build();
 
@@ -81,6 +92,7 @@ app.UseStaticFiles();
 
 app.MapDashboardEndpoints();
 app.MapVersionEndpoint();
+app.MapPrometheusScrapingEndpoint();
 
 app.MapHealthChecks("/health/live", new HealthCheckOptions
 {

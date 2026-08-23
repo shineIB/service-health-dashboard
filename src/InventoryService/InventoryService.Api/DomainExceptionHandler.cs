@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
+using InventoryService.Api.Telemetry;
 using InventoryService.Domain;
 
 namespace InventoryService.Api;
@@ -16,6 +17,11 @@ public sealed class DomainExceptionHandler : IExceptionHandler
         // a genuinely malformed request (400) or a transient failure (5xx/408).
         if (exception is InsufficientStockException insufficientStockException)
         {
+            // Counted here, not in the reserve endpoint itself: item.Reserve throws before
+            // returning, so this exception handler is the only place every insufficient-stock
+            // rejection actually passes through.
+            InventoryTelemetry.ReservationsFailed.Add(1, new KeyValuePair<string, object?>("reason", "insufficient_stock"));
+
             httpContext.Response.StatusCode = StatusCodes.Status409Conflict;
 
             await httpContext.Response.WriteAsJsonAsync(new ProblemDetails

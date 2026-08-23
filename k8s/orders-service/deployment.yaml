@@ -12,6 +12,12 @@ spec:
     metadata:
       labels:
         app: orders-service
+      annotations:
+        # Picked up by Prometheus's kubernetes_sd_configs (k8s/prometheus/configmap.yaml) on
+        # the next pod restart — no separate target list to keep in sync with this Deployment.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
         - name: orders-service

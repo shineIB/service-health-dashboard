@@ -1,0 +1,54 @@
+# No PVC: same trade-off as Prometheus/Jaeger — fine for a single local dev instance where
+# everything is provisioned as code anyway (see the two ConfigMaps below), so a lost pod loses
+# nothing that isn't already in git. A real deployment would still want a PVC, for
+# user-created dashboards/alerts if the "provisioned only" policy ever loosens.
+#
+# GF_AUTH_ANONYMOUS_ENABLED: local convenience, not a production setting — this is a
+# single-user cluster on one dev machine, and requiring a login (default admin/admin) to look
+# at a demo dashboard would just be friction with no actual access control behind it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: service-health-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.4.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          env:
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: "Viewer"
+          volumeMounts:
+            - name: datasource
+              mountPath: /etc/grafana/provisioning/datasources/datasource.yaml
+              subPath: datasource.yaml
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards/provider.yaml
+              subPath: provider.yaml
+            - name: dashboard-service-health
+              mountPath: /var/lib/grafana/dashboards/service-health.json
+              subPath: service-health.json
+      volumes:
+        - name: datasource
+          configMap:
+            name: grafana-datasource
+        - name: dashboard-provider
+          configMap:
+            name: grafana-dashboard-provider
+        - name: dashboard-service-health
+          configMap:
+            name: grafana-dashboard-service-health

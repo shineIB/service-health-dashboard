@@ -1,0 +1,21 @@
+# Provisioned as code, not clicked together in Grafana's UI — see dashboard-configmap.yaml
+# for why that distinction matters here. Grafana reads every *.yaml under
+# /etc/grafana/provisioning/datasources/ on startup and registers what it finds.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasource
+  namespace: service-health-dashboard
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        # Fixed uid, not left to auto-generate: the dashboard JSON (dashboard-configmap.yaml)
+        # references this datasource by uid, and that reference has to survive a
+        # datasource-configmap reapply without drifting.
+        uid: prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true

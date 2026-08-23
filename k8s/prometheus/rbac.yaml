@@ -1,0 +1,32 @@
+# Namespaced Role, not a ClusterRole: Prometheus's kubernetes_sd_configs (see configmap.yaml)
+# only ever asks for pods in this one namespace, so that's the entire blast radius it needs
+# read access to — no reason to hand it list/watch over every pod in the cluster.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: service-health-dashboard
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus-pod-reader
+  namespace: service-health-dashboard
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus-pod-reader
+  namespace: service-health-dashboard
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: service-health-dashboard
+roleRef:
+  kind: Role
+  name: prometheus-pod-reader
+  apiGroup: rbac.authorization.k8s.io

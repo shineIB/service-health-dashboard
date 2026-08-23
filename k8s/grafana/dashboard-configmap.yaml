@@ -1,0 +1,121 @@
+# The dashboard itself, as JSON, provisioned as code — not clicked together in Grafana's UI.
+# A dashboard that only exists because someone built it by hand in the running pod disappears
+# the moment that pod does, and was never in git in the first place. This file *is* the
+# dashboard; the pod is just where it happens to render.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-service-health
+  namespace: service-health-dashboard
+data:
+  service-health.json: |
+    {
+      "title": "Service Health Dashboard",
+      "uid": "service-health",
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "10s",
+      "time": { "from": "now-15m", "to": "now" },
+      "panels": [
+        {
+          "id": 1,
+          "title": "Orders created vs. rejected",
+          "type": "timeseries",
+          "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "sum(rate(orders_created_total[1m]))",
+              "legendFormat": "created",
+              "refId": "A"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "sum by (reason) (rate(orders_rejected_total[1m]))",
+              "legendFormat": "rejected: {{reason}}",
+              "refId": "B"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "title": "Reservations succeeded vs. failed",
+          "type": "timeseries",
+          "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "sum(rate(inventory_reservations_succeeded_total[1m]))",
+              "legendFormat": "succeeded",
+              "refId": "A"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "sum by (reason) (rate(inventory_reservations_failed_total[1m]))",
+              "legendFormat": "failed: {{reason}}",
+              "refId": "B"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "title": "HTTP request duration: p50 / p95 (orders-service, inventory-service)",
+          "type": "timeseries",
+          "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "histogram_quantile(0.50, sum by (le, app) (rate(http_server_request_duration_seconds_bucket{app=~\"orders-service|inventory-service\"}[5m])))",
+              "legendFormat": "{{app}} p50",
+              "refId": "A"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "histogram_quantile(0.95, sum by (le, app) (rate(http_server_request_duration_seconds_bucket{app=~\"orders-service|inventory-service\"}[5m])))",
+              "legendFormat": "{{app}} p95",
+              "refId": "B"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "title": "orders-service → inventory-service call error rate",
+          "type": "timeseries",
+          "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "(sum(rate(http_client_request_duration_seconds_count{app=\"orders-service\", server_address=\"inventory-service\"}[1m])) - sum(rate(http_client_request_duration_seconds_count{app=\"orders-service\", server_address=\"inventory-service\", http_response_status_code=~\"2..|409\"}[1m]))) / sum(rate(http_client_request_duration_seconds_count{app=\"orders-service\", server_address=\"inventory-service\"}[1m]))",
+              "legendFormat": "error rate",
+              "refId": "A"
+            }
+          ]
+        }
+      ]
+    }

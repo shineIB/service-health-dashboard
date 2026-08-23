@@ -721,3 +721,228 @@ Build__` mot de nybyggda images innan de laddades in (bekräftade
 `Build__GitSha=6f310da`/`Build__BuildTimeUtc=...` bakade in korrekt), sedan
 full omdeploy i minikube och `/api/services` samt dashboarden i webbläsaren
 — visade `0.1.0-dev @6f310da` för båda tjänsterna efter fixet.
+
+## Steg 6, del 2 — metrics-instrumentering. Klart och verifierat. Prometheus/Grafana ännu inte deployat (medvetet, se beslut nedan).
+
+**Beslut — omfattning för den här delen, valt via fråga innan jag började:**
+bara OpenTelemetry-metrics + `/metrics`-endpoint på alla tre tjänster,
+verifierat lokalt mot docker-compose. Ingen Prometheus/Grafana i det här
+passet — CLAUDE.md skrev redan "ev. Prometheus + Grafana" (inte ett
+bestämt beslut), och det är ett eget, större steg (nya manifest/tjänster i
+både compose och k8s). Blir en egen uppföljning, inte en del av den här.
+
+**Paket:** `OpenTelemetry.Exporter.Prometheus.AspNetCore`, version
+`1.18.0-beta.1` — fortfarande bara beta uppströms (har varit det i flera
+år; .NET OTel SIG har aldrig märkt en stabil Prometheus-exportör som
+"stable"), men råkar dela samma `1.18.0`-linje som resten av SDK:et. Vanligt
+förekommande i det skicket ändå, inte en varningsflagga i sig.
+
+**`WithMetrics(...)` bredvid befintlig `WithTracing(...)` i alla tre
+`Program.cs`.** `AddAspNetCoreInstrumentation()` + `AddHttpClientInstrumentation()`
+ger request-antal/latens per route gratis (samma paket som redan användes
+för traces — auto-instrumentering täcker båda utan extra paket).
+`AddPrometheusExporter()` + `app.MapPrometheusScrapingEndpoint()` — pull
+(scrape), inte OTLP-push: Jaeger förstår bara traces, och det finns ingen
+Prometheus deployad än för att ta emot en push heller.
+
+**Egna business-counters, samma motivering som de manuella spans:innan
+för reserve/release i steg 6 del 1** — auto-instrumentering ser HTTP-utfall
+(2xx/4xx), inte affärsutfall. En 201 kan vara "order skapad" men en 409 kan
+vara antingen "otillräckligt lager" eller (via orders-service) "inventory
+onåbar", och det skiljer man inte åt utan egna counters:
+- `OrdersTelemetry` (ny, `OrdersService.Api/Telemetry/`): `orders.created`,
+  `orders.rejected` (taggad `reason`: `insufficient_stock` |
+  `inventory_unavailable`), `orders.cancelled`. Incrementeras direkt vid
+  respektive call site i `OrderEndpoints.cs`.
+- `InventoryTelemetry` (utökad, samma fil som redan hade `ActivitySource`
+  för reserve/release-spans): `inventory.reservations.succeeded`,
+  `inventory.reservations.failed` (taggad `reason=insufficient_stock`),
+  `inventory.releases`. Succeeded/releases incrementeras i
+  `InventoryEndpoints.cs` efter lyckad `item.Reserve`/`item.Release`.
+  **Failed incrementeras centralt i `DomainExceptionHandler`, inte i
+  endpointen** — `item.Reserve` kastar `InsufficientStockException` istället
+  för att returnera ett fel-resultat, så exception-handlern är den enda
+  platsen varje avvisning faktiskt passerar.
+- `dashboard-service` fick bara auto-instrumentering, ingen egen Meter —
+  har inga egna affärsutfall att räkna än (pollnings-success/fail-rate är
+  en naturlig framtida metric, medvetet inte tillagd nu för att hålla
+  steget till auto-instrumentering där).
+
+**Upptäckt under testskrivning — en verklig race, inte ett testfel.**
+`WebApplicationFactory`-baserade tester som gjorde en POST följt direkt av
+en GET `/metrics` (ingen fördröjning alls) missade konsekvent den egna
+counter-metricen — men ASP.NET Core:s inbyggda instrument (skapade redan
+vid host-uppstart) dök alltid upp. Isolerat genom att köra om samma test
+med ett extra, ointressant request inklämt mellan POST och `/metrics`-läsningen:
+det räckte för att få counter-metricen att synas. Bekräftat att det INTE
+är ett wiring-fel genom att köra mot en riktig `docker compose up`-stack
+(riktig Kestrel, inte `TestServer`) — där syntes `orders_created_total`
+direkt på nästa `/metrics`-anrop utan någon fördröjning alls, eftersom en
+vanlig `curl`-till-`curl`-sekvens redan har gott om väggklocketid mellan
+sig. Slutsats: en förstagångs-publicering av ett helt nytt, aldrig tidigare
+använt instrument (lazy `static readonly Meter`/`Counter<T>`, skapat först
+vid första faktiska `.Add()`-anropet) kapplöper mot OTel SDK:ets egen
+instrument-bokföring specifikt när två requests körs rygg-mot-rygg i samma
+process utan någon paus — inte en bugg i vår kod, och inte reproducerbart
+i en riktig körande tjänst där det naturligt finns tid mellan händelser.
+**Fix, samma stil som `ReservationExpiryTests`** (vänta in ett bakgrunds-
+tillstånd istället för att mocka bort det): en liten
+`ScrapeMetricsUntilAsync`-hjälpare i varje `MetricsEndpointTests`-klass som
+pollar `/metrics` upp till 2s (50ms mellanrum) tills den förväntade metricen
+dyker upp, istället för ett enda omedelbart anrop.
+
+**Testtäckning:** `MetricsEndpointTests` i alla tre Api-testprojekt.
+Kontrollerar bara *förekomst* av metric-namn i scrape-texten, aldrig exakta
+värden — `OrdersTelemetry`/`InventoryTelemetry`s `Meter` är statiska,
+process-globala instrument, så varje `WebApplicationFactory` i samma
+testassembly (en per testklass) observerar samma underliggande counters;
+att hävda ett exakt antal hade varit skört mot vad andra testklasser i
+samma process råkar ha gjort. Alla 74 tester i lösningen gröna.
+
+**Verifierat på riktigt mot docker-compose** (inte bara enhetstester):
+`docker compose up --build` med orders/inventory/deras Postgres/Jaeger.
+Skapade ett lager, skapade en order (`orders_created_total` dök upp,
+`inventory_reservations_succeeded_total` med), försökte beställa mer än
+tillgängligt lager (409, `orders_rejected_total{reason="insufficient_stock"}`
+och `inventory_reservations_failed_total{reason="insufficient_stock"}`),
+avbokade den lyckade ordern (`orders_cancelled_total`,
+`inventory_releases_total`). Alla sex counters bekräftade med rätt
+tagg-värden mot en riktig körande Kestrel-process. Inte omdeployat till
+minikube i det här passet — samma "verifiera lokalt, k8s-utrullning är ett
+separat steg" som redan är etablerat mönster (se t.ex. steg 3 del 1 vs.
+steg 4).
+
+Nästa steg: Prometheus + Grafana (egen uppföljning till steg 6 del 2,
+scrapear `/metrics` på alla tre tjänster), sedan steg 7 (tredje tjänsten +
+meddelandebuss).
+
+## Steg 6, del 3 — Prometheus + Grafana i minikube. Klart och verifierat.
+
+**Beslut, givna innan jag började (inte omförhandlade):** Prometheus som
+Deployment med scrape-config via annotation-baserad `kubernetes_sd_configs`
+(inte en handskriven target-lista), Grafana med Prometheus som datakälla.
+Dashboarden provisionerad som kod (datasource + dashboard som ConfigMaps),
+inte klickihopad i Grafanas UI — en dashboard som bara finns i podden
+försvinner med podden och finns inte i git. Fyra paneler som betyder något
+för just det här systemet (ordrar skapade/avvisade per reason,
+reservationer lyckade/misslyckade, HTTP-latens p50/p95, felfrekvens
+orders→inventory), ingen CPU/minne-panel.
+
+**`k8s/`, inte docker-compose.** Det här är infrastruktur som ska visa att
+jag kan drifta observability i Kubernetes, inte applikationskod — minikube
+är där det faktiskt betyder något. (docker-compose fick det inte, till
+skillnad från Jaeger i steg 6 del 1 som fanns i båda — bedömt som
+onödigt här: Prometheus/Grafana-uppsättningen i sig är poängen, inte att
+kunna se den snabbare lokalt.)
+
+**RBAC: namespacad `Role`, inte `ClusterRole`.** Prometheus `kubernetes_sd_configs`
+(`role: pod`) är redan begränsad till `namespaces.names:
+["service-health-dashboard"]` i scrape-configen, så en `Role` +
+`RoleBinding` i samma namespace räcker — `prometheus`-ServiceAccounten får
+`get/list/watch` på `pods`, ingenting utanför den enda namespace den
+faktiskt frågar om. En `ClusterRole` hade gett `list/watch` över varje pod
+i hela klustret för en förmåga som aldrig används.
+
+**Annotation-baserad discovery, inte en target-lista.** `k8s/prometheus/configmap.yaml`
+har en `relabel_configs`-kedja (samma väletablerade community-mönster som
+används överallt där Prometheus körs mot Kubernetes utan Operator): behåll
+bara poddar taggade `prometheus.io/scrape: "true"`, läs port/path från
+`prometheus.io/port`/`prometheus.io/path`, och `labelmap` för att lyfta
+podd-labeln `app` (redan satt på alla tre Deployments sedan tidigare) till
+en Prometheus-label — det är `app`-labeln dashboard-frågorna sedan
+selekterar på (`app=~"orders-service|inventory-service"`), inte
+podnamn/IP. orders-service/inventory-service/dashboard-service fick
+`prometheus.io/scrape`/`port`/`path`-annoteringar i sina `deployment.yaml`
+— en fjärde tjänst som läggs till senare plockas upp automatiskt nästa
+gång dess Deployment rullas ut, ingen fil att komma ihåg att uppdatera här.
+
+**Grafana provisionerad, inte klickad.** Tre ConfigMaps:
+`grafana-datasource` (datasource.yaml, fast `uid: prometheus` så
+dashboard-JSON:en kan referera den utan att den drifar vid en ny apply),
+`grafana-dashboard-provider` (pekar ut var dashboard-JSON-filer letas upp),
+`grafana-dashboard-service-health` (själva dashboard-JSON:en). Alla tre
+monterade som enskilda filer via `subPath` i `k8s/grafana/deployment.yaml`
+— medvetet, för att inte krocka med varandra i samma katalog.
+`GF_AUTH_ANONYMOUS_ENABLED=true` (Viewer-roll): ren lokal bekvämlighet för
+en enanvändarkluster på en enda dev-maskin, inte en säkerhetsavvägning —
+`allowUiUpdates: false` i provider-configen är den faktiska spärren mot att
+någon klickar ihop ändringar som sedan försvinner (Grafana tillåter då inte
+ens att spara ändringar i UI:t för en provisionerad dashboard).
+
+**Upptäckt — `subPath`-ConfigMap-mounts hot-reloadar inte.** Grafanas
+egen filbaserade dashboard-provisionering pollar sin katalog var 30:e
+sekund (`updateIntervalSeconds: 30`) och skulle i teorin plocka upp en
+ändrad JSON-fil automatiskt — men det gäller bara om filen faktiskt ändras
+i podden. Kubelet uppdaterar *inte* en `subPath`-monterad ConfigMap-fil när
+ConfigMapen ändras (välkänd k8s-begränsning, till skillnad från en
+hel-katalog-mount som synkas med viss fördröjning). Upptäckt när jag
+korrigerade error-rate-panelens fråga (se nedan), applicerade om
+ConfigMapen och inget hände i Grafana. Fix: `kubectl rollout restart
+deployment/grafana` efter varje `kubectl apply` av dashboard-ConfigMapen —
+dokumenterat i README, inte bara här, eftersom det är den typen av
+"varför funkade inte min ändring"-fälla som redan finns dokumenterad för
+`minikube image load` i steg 6 del 1/uppföljningen ovan.
+
+**Upptäckt — den första error-rate-frågan mätte fel sak.** Första
+versionen av panel 4 var `sum(rate(http_client_request_duration_seconds_count{app="orders-service",
+http_response_status_code!~"2.."}[1m])) / sum(rate(...totalt...))`. Mot
+riktig trafik visade den ~20 % "felfrekvens" **innan** inventory-service
+ens skalades ner — inte en bugg i mätningen, en bugg i vad frågan faktiskt
+räknade: OpenTelemetry:s HttpClient-instrumentering sätter `error_type`
+till statuskoden som sträng (`error_type="409"`) för **alla** icke-2xx-svar,
+inklusive ett fullt förväntat domän-409 (otillräckligt lager) — inte bara
+för riktiga undantag. Bekräftat genom att läsa orders-service:s egen
+`/metrics` rått: en lyckad reservation ger
+`http_response_status_code="200"`, en 409 ger `error_type="409"` +
+`http_response_status_code="409"`, och en genuint onåbar inventory-service
+ger `error_type="System.Threading.Tasks.TaskCanceledException"` **utan**
+någon `http_response_status_code`-label alls. Samma rådata visade också
+att anropet till Jaeger (OTLP-export) går genom samma
+HttpClient-instrumentering, taggat `server_address="jaeger"` — utan att
+filtrera på `server_address="inventory-service"` hade panelen blandat ihop
+telemetri-exporten med det faktiska orders→inventory-anropet.
+**Fix:** `(total − (2xx + 409)) / total`, scopead till
+`server_address="inventory-service"` —räknar allt som varken är en lyckad
+reservation eller ett förväntat domän-409 som ett fel, vilket är exakt
+"felfrekvens på orders → inventory-anropet" och inte "andel svar som inte
+var 200".
+
+**Images:** `prom/prometheus:v3.1.0`, `grafana/grafana:11.4.0` — pinnade
+specifika versioner (samma konvention som `jaegertracing/all-in-one:1.76.0`
+och `postgres:16-alpine`), bekräftat att de faktiskt går att dra innan de
+skrevs in i manifesten. Ingen PVC för någon av dem — samma avvägning som
+Jaeger: en lokal dev-instans tål att tappa TSDB-data/dashboards-cache vid
+en pod-omstart eftersom allt som faktiskt spelar roll (dashboard,
+datasource) redan är i git.
+
+**Verifierat på riktigt i minikube** (inte bara `kubectl apply` utan fel):
+
+1. Byggde om alla tre app-images (de som redan låg i klustret saknade
+   metrics-koden från del 2) med samma `GIT_SHA`/`BUILD_TIME`-build-args
+   som uppföljningen ovan, samma skala-ner-ta-bort-ladda-om-skala-upp-cykel
+   för att undvika det redan dokumenterade `minikube image load`-fallgropen.
+2. `kubectl apply` av `k8s/prometheus/` och `k8s/grafana/`, båda rullade ut
+   rent. Prometheus `/api/v1/targets` bekräftade alla tre app-poddar `up`
+   med rätt `scrapeUrl` (`http://<pod-ip>:8080/metrics`) — annotation-
+   discoveryn fungerade utan någon manuell target-konfiguration.
+3. Genererade kontinuerlig blandad trafik (lyckade ordrar, avvisade för
+   otillräckligt lager) mot en riktig `kubectl port-forward`-tunnel, bekräftade
+   i Prometheus att `orders_created_total`/`orders_rejected_total`/
+   `inventory_reservations_succeeded_total`/`_failed_total` alla visade
+   rätt värden och taggar.
+4. Öppnade Grafana-dashboarden i Chrome (via `kubectl port-forward`) —
+   alla fyra paneler renderade med riktig data, ingen manuell UI-konfiguration.
+5. `kubectl scale deployment/inventory-service --replicas=0` medan trafiken
+   fortsatte: samtliga fyra paneler rörde sig tillsammans i samma
+   tidsfönster — nya avvisningar bytte reason från `insufficient_stock` till
+   `inventory_unavailable`, p95-latensen för orders-service klättrade
+   (resiliens-pipelinens omförsök), och felfrekvens-panelen gick till 100 %.
+   Skärmdump tagen.
+6. `kubectl scale deployment/inventory-service --replicas=1`: samtliga fyra
+   paneler återhämtade sig i samma graf utan omstart av orders-service —
+   felfrekvensen gick tillbaka till 0 %, latensen normaliserades,
+   reservationer lyckades igen. Skärmdump av hela förlopp-och-återhämtning
+   i en och samma bild (`docs/screenshots/grafana-dashboard-incident-and-recovery.jpg`),
+   använd i README.
+
+Nästa steg: steg 7 (tredje tjänsten + meddelandebuss).

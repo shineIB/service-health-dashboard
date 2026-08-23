@@ -1,0 +1,36 @@
+# No PVC: same call as Jaeger (see k8s/jaeger/deployment.yaml) — TSDB data lives on the
+# container's ephemeral filesystem and doesn't survive a pod restart. Right trade-off for a
+# single local dev instance where "restart Prometheus" just means losing recent history, not
+# for a real deployment (needs a PVC or a remote-write backend).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: service-health-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus/prometheus.yml
+              subPath: prometheus.yml
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config

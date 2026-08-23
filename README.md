@@ -94,13 +94,33 @@ kubectl -n service-health-dashboard rollout status deployment/orders-service
 kubectl -n service-health-dashboard rollout status deployment/inventory-service
 kubectl -n service-health-dashboard rollout status deployment/dashboard-service
 
+# Prometheus (scrapes the three app pods above via their prometheus.io/* annotations —
+# see "Metrics dashboards" below) and Grafana (dashboard provisioned from k8s/grafana/, not
+# clicked together by hand)
+kubectl -n service-health-dashboard apply \
+  -f k8s/prometheus/rbac.yaml -f k8s/prometheus/configmap.yaml \
+  -f k8s/prometheus/deployment.yaml -f k8s/prometheus/service.yaml
+kubectl -n service-health-dashboard rollout status deployment/prometheus
+
+kubectl -n service-health-dashboard apply \
+  -f k8s/grafana/datasource-configmap.yaml -f k8s/grafana/dashboard-provider-configmap.yaml \
+  -f k8s/grafana/dashboard-configmap.yaml -f k8s/grafana/deployment.yaml -f k8s/grafana/service.yaml
+kubectl -n service-health-dashboard rollout status deployment/grafana
+
 # Opens a tunnel and prints a URL — on the Docker driver (Windows/macOS) this blocks
 # and needs its terminal left open for the tunnel to stay up
 minikube service dashboard-service -n service-health-dashboard
 
-# Same for Jaeger's UI, in another terminal
+# Same for Jaeger's UI, Prometheus's UI, and Grafana, each in their own terminal
 minikube service jaeger -n service-health-dashboard
+minikube service prometheus -n service-health-dashboard
+minikube service grafana -n service-health-dashboard
 ```
+
+**Reapplying `k8s/grafana/dashboard-configmap.yaml` after editing the dashboard JSON needs a
+pod restart to take effect** (`kubectl -n service-health-dashboard rollout restart
+deployment/grafana`) — it's mounted with `subPath`, and kubelet does not live-update `subPath`
+ConfigMap mounts the way it does whole-directory mounts.
 
 ### Troubleshooting: `minikube image load` silently keeping a stale image
 
@@ -168,6 +188,34 @@ OpenTelemetry traces every request across both services that talk to each other 
 
 ![A trace showing retry attempts and the circuit breaker opening](docs/screenshots/jaeger-trace-retry-circuit-breaker.jpg)
 
+## Metrics
+
+All three services expose OpenTelemetry metrics at `GET /metrics` in Prometheus text format — ASP.NET Core/HttpClient request counts and latency histograms for free from auto-instrumentation, plus a handful of business counters for the outcomes that matter: `orders_created_total`, `orders_rejected_total` (tagged `reason=insufficient_stock|inventory_unavailable`), `orders_cancelled_total` on orders-service; `inventory_reservations_succeeded_total`, `inventory_reservations_failed_total` (tagged `reason=insufficient_stock`), `inventory_releases_total` on inventory-service.
+
+Pull-based (scraped, not pushed over OTLP) — Jaeger only understands traces, and OTLP metric export needs something to receive it. Try it against the Docker Compose stack:
+
+```bash
+curl http://localhost:8080/metrics | grep orders_
+curl http://localhost:8081/metrics | grep inventory_
+```
+
+## Metrics dashboards (Prometheus + Grafana)
+
+In `k8s/`, not Docker Compose — this is infrastructure, not application code, and minikube is where it earns its keep. Prometheus discovers what to scrape via `kubernetes_sd_configs` (pod role) plus `prometheus.io/scrape`/`port`/`path` annotations already on orders-service/inventory-service/dashboard-service's Deployments (`k8s/prometheus/configmap.yaml`) — a fourth service added later gets picked up the moment its Deployment carries the same annotations, no target list to maintain by hand.
+
+**Grafana's datasource and dashboard are provisioned as code** — two ConfigMaps (`k8s/grafana/datasource-configmap.yaml`, `k8s/grafana/dashboard-configmap.yaml`), not clicked together in the UI (`GF_AUTH_ANONYMOUS_ENABLED=true` even makes the UI read-only for exactly that reason — see `k8s/grafana/deployment.yaml`). A dashboard that only exists because someone built it by hand in the running pod disappears with that pod and was never in git; provisioning from a ConfigMap means the dashboard *is* version-controlled, and `kubectl apply` rebuilds it identically on a fresh cluster.
+
+One dashboard, four panels chosen for what they say about *this* system specifically — no CPU/memory panels, which say nothing about it:
+
+- **Orders created vs. rejected**, split by rejection reason (`insufficient_stock` vs `inventory_unavailable`)
+- **Reservations succeeded vs. failed** on inventory-service
+- **HTTP request duration p50/p95** for orders-service and inventory-service
+- **orders-service → inventory-service call error rate** — deliberately excludes `409` (insufficient stock is a normal business outcome, not an error) so this panel reacts only to genuine infrastructure failure
+
+**Scaling `inventory-service` to 0 while generating order traffic**, all four panels move together and then recover once it's scaled back up — rejections shift from `insufficient_stock` to `inventory_unavailable`, p95 latency climbs as the resilience pipeline retries, and the error-rate panel spikes to 100% and back down to 0 without anyone touching orders-service:
+
+![Grafana dashboard showing an inventory-service outage and automatic recovery across all four panels](docs/screenshots/grafana-dashboard-incident-and-recovery.jpg)
+
 ## Architecture decisions
 
 **Fail-closed, not optimistic.** `orders-service` rejects an order it can't confirm stock for, rather than accepting it and reconciling later. The alternative — accept now, settle later — was rejected because overselling is more expensive to unwind than a customer seeing a retryable `503`. Backed by a Polly v8 resilience pipeline (timeout, retry with backoff + jitter, circuit breaker) that only retries transient failures, never a `409` (insufficient stock) or `404`.
@@ -182,7 +230,8 @@ OpenTelemetry traces every request across both services that talk to each other 
 
 ## Not done yet
 
-- **Metrics (step 6, part 2).** Distributed tracing and structured logging are done — see "Distributed tracing" above. OpenTelemetry metrics and a Prometheus/Grafana stack are not; the only quantitative signal beyond traces today is the health/version data the dashboard already shows.
+Step 6 (distributed tracing, structured logging, metrics, Prometheus + Grafana) is done — see "Distributed tracing", "Metrics", and "Metrics dashboards" above.
+
 - **A third service and a real message bus (step 7).** `notifications-service` doesn't exist yet; orders→inventory is the only inter-service call, and it's synchronous HTTP, not events. Deferred deliberately — see `CLAUDE.md` for why the bus comes after two services are stable, not before.
 - **CI/CD (step 8).** Everything above is built and deployed by hand (`docker build`, `minikube image load`, `kubectl apply`). No GitHub Actions pipeline yet for build/test/image push, let alone auto-deploy.
 

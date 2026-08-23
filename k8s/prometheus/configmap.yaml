@@ -1,0 +1,48 @@
+# kubernetes_sd_configs + annotation-based relabeling, not a hardcoded target list: any
+# Deployment in this namespace that carries prometheus.io/scrape=true gets picked up
+# automatically on its next pod restart, without ever touching this file. That's the whole
+# point — see orders-service/inventory-service/dashboard-service's deployment.yaml for the
+# annotations this matches.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: service-health-dashboard
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+
+    scrape_configs:
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: ["service-health-dashboard"]
+        relabel_configs:
+          # Only scrape pods that opted in via the annotation — otherwise Prometheus would
+          # also try (and fail) to scrape its own Postgres/Jaeger pods, which don't speak
+          # Prometheus's text format at all.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          # Promotes the pod's own "app" label (orders-service/inventory-service/
+          # dashboard-service) onto every scraped series, so dashboard queries can select
+          # by app=~"orders-service|inventory-service" instead of by pod name/IP.
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod

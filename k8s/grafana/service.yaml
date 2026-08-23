@@ -1,0 +1,15 @@
+# NodePort, same pattern as jaeger/orders-service/dashboard-service:
+# `minikube service grafana -n service-health-dashboard --url`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: service-health-dashboard
+spec:
+  type: NodePort
+  selector:
+    app: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000

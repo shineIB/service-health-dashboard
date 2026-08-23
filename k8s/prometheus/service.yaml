@@ -1,0 +1,17 @@
+# NodePort so the UI/API is reachable the same way as the other NodePort services here
+# (`minikube service prometheus -n service-health-dashboard`) — mainly useful for checking
+# Status > Targets to confirm the annotation-based discovery actually found the three app
+# pods, without needing to go through Grafana for that.
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: service-health-dashboard
+spec:
+  type: NodePort
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090

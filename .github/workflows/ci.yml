@@ -58,13 +58,17 @@ jobs:
       - name: Build
         run: dotnet build ServiceHealthDashboard.sln --configuration Release --no-restore
 
+      # appsettings.json is loaded relative to the working directory, not the DLL's
+      # location, so this has to run from the publish output folder itself.
       - name: Apply orders-service migrations
-        run: dotnet src/OrdersService/OrdersService.Api/bin/Release/net9.0/OrdersService.Api.dll --migrate-only
+        working-directory: src/OrdersService/OrdersService.Api/bin/Release/net9.0
+        run: dotnet OrdersService.Api.dll --migrate-only
         env:
           Database__RunMigrationsOnStartup: "true"
 
       - name: Apply inventory-service migrations
-        run: dotnet src/InventoryService/InventoryService.Api/bin/Release/net9.0/InventoryService.Api.dll --migrate-only
+        working-directory: src/InventoryService/InventoryService.Api/bin/Release/net9.0
+        run: dotnet InventoryService.Api.dll --migrate-only
         env:
           Database__RunMigrationsOnStartup: "true"
 

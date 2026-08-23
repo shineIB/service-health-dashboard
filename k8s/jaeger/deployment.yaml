@@ -1,0 +1,32 @@
+# All-in-one (collector + query + in-memory storage) — the right shape for a single local
+# dev cluster, not for production. No separate OTel Collector in front of it: at this scale
+# it would just be a relay with nothing to batch, filter, or fan out to yet — see CLAUDE.md
+# for when that changes. Traces are in-memory only: they don't survive a pod restart, which
+# is fine for local dev and wrong for production (needs a real backend — Elasticsearch,
+# Cassandra, or a managed tracing store).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: service-health-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one:1.76.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: COLLECTOR_OTLP_ENABLED
+              value: "true"
+          ports:
+            - containerPort: 16686 # UI
+            - containerPort: 4317  # OTLP gRPC — what the three services export to
+            - containerPort: 4318  # OTLP HTTP

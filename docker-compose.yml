@@ -1,4 +1,13 @@
 services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # UI
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -28,10 +37,13 @@ services:
       Infrastructure__ConnectionString: "Host=postgres;Port=5432;Database=orders;Username=orders;Password=orders"
       Database__RunMigrationsOnStartup: "true"
       InventoryClient__BaseUrl: "http://inventory-service:8080"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
     depends_on:
       postgres:
         condition: service_healthy
       inventory-service:
+        condition: service_started
+      jaeger:
         condition: service_started
 
   inventory-postgres:
@@ -62,9 +74,12 @@ services:
     environment:
       Infrastructure__ConnectionString: "Host=inventory-postgres;Port=5432;Database=inventory;Username=inventory;Password=inventory"
       Database__RunMigrationsOnStartup: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
     depends_on:
       inventory-postgres:
         condition: service_healthy
+      jaeger:
+        condition: service_started
 
   dashboard-service:
     build:
@@ -80,9 +95,11 @@ services:
       MonitoredServices__Services__0__BaseUrl: "http://orders-service:8080"
       MonitoredServices__Services__1__Name: "inventory-service"
       MonitoredServices__Services__1__BaseUrl: "http://inventory-service:8080"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
     depends_on:
       - orders-service
       - inventory-service
+      - jaeger
 
 volumes:
   orders-postgres-data:

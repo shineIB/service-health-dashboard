@@ -33,6 +33,10 @@ spec:
               value: "inventory-service"
             - name: MonitoredServices__Services__1__BaseUrl
               value: "http://inventory-service:8080"
+            # Read directly by the OTel SDK — no typed options class needed for a standard,
+            # spec-defined OTel env var. See k8s/jaeger and CLAUDE.md.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger:4317"
           # Same reasoning as orders-service/inventory-service's probes (see
           # orders-service/deployment.yaml) — same app shape, same budget. dashboard-api's
           # /health/live and /health/ready are identical here (no dependency of its own to

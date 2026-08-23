@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.Extensions.Options;
 using InventoryService.Api.Contracts;
+using InventoryService.Api.Telemetry;
 using InventoryService.Domain;
 using InventoryService.Infrastructure;
 
@@ -69,6 +70,10 @@ public static class InventoryEndpoints
         TimeProvider timeProvider,
         CancellationToken cancellationToken)
     {
+        using var activity = InventoryTelemetry.ActivitySource.StartActivity("inventory.reserve");
+        activity?.SetTag("order.id", request.OrderId);
+        activity?.SetTag("product.id", productId);
+
         var item = await repository.GetByProductIdAsync(productId, cancellationToken);
         if (item is null)
             return TypedResults.NotFound();
@@ -85,6 +90,10 @@ public static class InventoryEndpoints
         IInventoryRepository repository,
         CancellationToken cancellationToken)
     {
+        using var activity = InventoryTelemetry.ActivitySource.StartActivity("inventory.release");
+        activity?.SetTag("order.id", request.OrderId);
+        activity?.SetTag("product.id", productId);
+
         var item = await repository.GetByProductIdAsync(productId, cancellationToken);
         if (item is null)
             return TypedResults.NotFound();

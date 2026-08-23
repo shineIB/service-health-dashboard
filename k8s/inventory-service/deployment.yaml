@@ -22,6 +22,10 @@ spec:
           env:
             - name: Database__RunMigrationsOnStartup
               value: "false"
+            # Read directly by the OTel SDK — no typed options class needed for a standard,
+            # spec-defined OTel env var. See k8s/jaeger and CLAUDE.md.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger:4317"
           envFrom:
             - secretRef:
                 name: inventory-service-secret

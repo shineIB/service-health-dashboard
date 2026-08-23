@@ -3,7 +3,9 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Http.Resilience;
 using Polly;
+using Polly.Telemetry;
 using OrdersService.Domain;
+using OrdersService.Infrastructure.Telemetry;
 
 namespace OrdersService.Infrastructure;
 
@@ -38,6 +40,11 @@ public static class ServiceCollectionExtensions
     {
         var inventoryOptions = configuration.GetSection(InventoryClientOptions.SectionName).Get<InventoryClientOptions>()
             ?? throw new InvalidOperationException($"Missing configuration section '{InventoryClientOptions.SectionName}'.");
+
+        // Applies to every named resilience pipeline in this service, not just this one —
+        // there's only one today, but this is where a second one would pick it up for free.
+        services.Configure<TelemetryOptions>(options =>
+            options.TelemetryListeners.Add(new PollyActivityTelemetryListener()));
 
         services.AddHttpClient<IInventoryClient, InventoryClient>(client =>
             {

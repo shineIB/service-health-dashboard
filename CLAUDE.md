@@ -541,3 +541,146 @@ Postgres krävd. Bekräftat att exakt en Postgres-container (plus
 Testcontainers egen Ryuk-reaper) skapas per testprojekt, inte en per
 testklass. `gh run watch` på den bantade workflowen — grön, alla tre
 Docker-images också gröna.
+
+## Steg 6, del 1 — distribuerad tracing + strukturerad loggning. Klart och verifierat.
+
+Beslut som gavs, inte omförhandlade: OpenTelemetry .NET med
+auto-instrumentering (ASP.NET Core, HttpClient, Npgsql) i alla tre
+tjänster; Jaeger all-in-one i klustret som OTLP-mottagare, ingen Collector;
+100 % sampling lokalt; Polly v8-telemetri som egna spans för retries/circuit
+breaker; manuella spans för `reserve`/`release` med order-id och artikel-id;
+inbyggd `ILogger` + `AddJsonConsole`, ingen Serilog; varje logg berikad med
+`trace_id`/`span_id`.
+
+**Paket** (alla tre Api-projekt, version 1.18.0): `OpenTelemetry`,
+`OpenTelemetry.Extensions.Hosting`, `OpenTelemetry.Exporter.OpenTelemetryProtocol`,
+`OpenTelemetry.Instrumentation.AspNetCore`, `OpenTelemetry.Instrumentation.Http`.
+**Ingen** separat instrumenteringspaket för Npgsql — Npgsql har sedan
+version 7 en egen inbyggd `ActivitySource` (namn `"Npgsql"`); det räcker med
+`.AddSource("Npgsql")` på `TracerProviderBuilder`, bekräftat genom att
+reflektera över `Npgsql.dll` innan jag litade på det.
+
+**`OTEL_EXPORTER_OTLP_ENDPOINT` är inte en typad options-klass, avsiktligt.**
+Kodkonventionen säger "inga magiska strängar, använd typade options-klasser"
+för *vår egen* config — men det här är OpenTelemetry SDK:ets eget,
+spec-definierade env-var-namn (samma sak som `ASPNETCORE_URLS` är Kestrels,
+inte vårt). SDK:et läser den själv; att linda in den i en egen options-klass
+hade bara dolt en redan standardiserad mekanism. Default är
+`http://localhost:4317`, vilket matchar Jaeger-porten rakt av både i
+docker-compose och lokalt utan container — ingen extra config behövs för det
+vanliga fallet.
+
+**`ConfigureResource(r => r.AddService("orders-service"))` per tjänst,
+inte SDK-default.** Utan den rapporterar alla tre tjänster som
+`unknown_service:dotnet` i Jaeger — SDK:et gissar inte tjänstenamnet från
+entry-assemblyn, upptäckt genom att faktiskt titta i Jaeger:s
+`/api/services` innan jag antog att det bara skulle fungera.
+
+**Manuella spans:** `InventoryTelemetry.ActivitySource` (namn
+`"InventoryService.Api"`) i `InventoryService.Api/Telemetry/`, startade
+runt hela `ReserveStock`/`ReleaseStock`-handlers i `InventoryEndpoints.cs`
+med taggarna `order.id` och `product.id`. Ligger i Api-lagret (inte
+Domain) — domänen ska vara fri från infrastrukturberoenden, och
+OpenTelemetry är precis den typen av cross-cutting concern som hör hemma
+i Api/Infrastructure, inte i `InventoryItem.Reserve`/`Release` själva.
+
+**Upptäckt — Polly v8:s inbyggda telemetri skapar INTE spans, bara metrics
+och loggar.** Trots att "Polly" dyker upp som en `ActivitySource`-liknande
+sträng i `Polly.Extensions.dll` (bekräftat genom att reflektera över
+assemblyn) är den bara en logger-kategori — `.AddSource("Polly")` på
+`TracerProviderBuilder` gav noll spans även under en riktig retry-storm.
+Bekräftat mot både Pollys egen dokumentation (pollydocs.org nämner bara
+metrics/loggar under "Telemetry", inget om `ActivitySource`) och en
+tredjepartsartikel som visade att andra manuellt bygger sina egna spans
+ovanpå Pollys telemetri-event. Löst med en egen
+`PollyActivityTelemetryListener : Polly.Telemetry.TelemetryListener` i
+`OrdersService.Infrastructure/Telemetry/` som lyssnar på alla Polly-events
+(`OnRetry`, `OnCircuitOpened`, `ExecutionAttempt`, `PipelineExecuting`/
+`PipelineExecuted`, m.fl.) och själv startar en `Activity` på en
+`ActivitySource` som **heter** `"Polly"` — samma namn som
+`.AddSource("Polly")` redan lyssnade på, så ingen ändring behövdes på
+OTel-sidan. Registrerad via
+`services.Configure<TelemetryOptions>(o => o.TelemetryListeners.Add(...))`
+i `AddInventoryClient`, vilket gäller alla namngivna resilience-pipelines
+i tjänsten (bara en idag, men gratis om en till tillkommer).
+
+**Strukturerad loggning:** `builder.Logging.ClearProviders()` +
+`AddJsonConsole(o => o.IncludeScopes = true)` i alla tre `Program.cs`. En
+liten `app.Use(...)`-middleware, registrerad direkt efter `builder.Build()`
+(före `UseExceptionHandler` m.fl.), lägger `Activity.Current`s `TraceId`/
+`SpanId` i en logg-scope med exakt nycklarna `trace_id`/`span_id` (inte
+ramverkets egna PascalCase `TraceId`/`SpanId` — `ActivityTrackingOptions`
+sattes till `None` för att inte få båda samtidigt, vilket annars dubblerar
+informationen i varje JSON-rad). **Bieffekt:** `ClearProviders()` tog även
+bort Windows EventLog-providern som orsakade den flakiga
+`ObjectDisposedException`/`EventLogInternal`-buggen i lokala testkörningar
+på Windows (se steg 8-anteckningarna ovan) — inte varför ändringen gjordes,
+men värt att notera att den städade upp det på köpet.
+
+**Kubernetes:** `k8s/jaeger/` (ny mapp) — en Deployment
+(`jaegertracing/all-in-one:1.76.0`, `COLLECTOR_OTLP_ENABLED=true`) och en
+Service (NodePort, tre namngivna portar: `ui` 16686, `otlp-grpc` 4317,
+`otlp-http` 4318 — allihop NodePort:ade som en bieffekt av att de delar en
+Service, men det är ofarligt eftersom tjänsterna i klustret ändå når Jaeger
+via ClusterIP:n på `http://jaeger:4317`, oavsett Service-typ).
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317` tillagt i alla tre
+service-Deploymentens `env:`. **Ingen persistent lagring** — Jaeger
+all-in-one lagrar in-memory, traces överlever inte en pod-omstart. Rätt
+avvägning för en enda lokal dev-instans; en riktig backend
+(Elasticsearch/Cassandra/managed) och en OTel Collector framför den
+(batching, sampling, fan-out till fler backends) är vad produktion skulle
+kräva — medvetet inte byggt nu, som redan beslutat.
+
+`docker-compose.yml` fick samma sak (egen `jaeger`-service, samma env-var
+per tjänst) — inte för att det krävdes, utan för att kunna verifiera
+end-to-end-kopplingen lokalt på sekunder istället för att betala
+`minikube image load`-cykeln för varje litet fel. Det var såhär
+Polly-gapet ovan faktiskt hittades — mot docker-compose, inte i klustret.
+
+**Verifierat i minikube** (samma krav som tidigare steg — riktig körning,
+inte bara kod som kompilerar):
+
+1. Byggde alla tre images på nytt, körde in i noden. Träffade **samma
+   `minikube image load`-fälla som redan är dokumenterad i README** —
+   `minikube image load` behöll tyst de gamla image-innehållen under
+   samma tagg, trots `minikube image rm` följt av `minikube image load`.
+   Orsaken den här gången: två gamla, redan avslutade
+   `orders-migrate`/`inventory-migrate`-Jobs (15 timmar gamla, kvar sedan
+   steg 4) höll fortfarande i de gamla image-ID:na, vilket blockerade
+   `docker rmi` på noden. Skalade ner de tre app-Deploymentsen till 0,
+   tog bort de gamla migration-Jobben (engångs, redan `Completed`, säkert
+   att ta bort), tog bort de gamla images:na för hand
+   (`minikube ssh -- docker rm <container>` följt av `minikube image rm`),
+   laddade om, skalade upp igen. Bekräftar bara att README:s
+   felsökningsavsnitt är korrekt, inte ett nytt problem.
+2. Skapade en riktig order genom hela kedjan (orders-service NodePort →
+   inventory-service → båda Postgres-instanserna). En trace i Jaeger med
+   10 spans över två tjänster: `orders-service: POST /orders/` →
+   Polly-pipelinens `PipelineExecuting`/`POST`/`PipelineExecuted`/
+   `ExecutionAttempt` → `inventory-service: POST /inventory/{productId}/reserve`
+   → den manuella `inventory.reserve`-spannen (taggad med rätt `order.id`
+   och `product.id`, bekräftat via DOM-inspektion — Jaeger UI:ts
+   tagg-panel hade en visuell renderingsbugg i skärmdumpen där värdena
+   fanns i DOM:en men inte målades i JPEG-capturen) → två `Npgsql`-spans
+   under `inventory-service` och en under `orders-service`. Skärmdump i
+   README.
+3. `kubectl scale deployment/inventory-service --replicas=0`, skapade
+   fler ordrar. Traces visade `OnRetry`- och `OnCircuitOpened`-spans från
+   `PollyActivityTelemetryListener`, plus det underliggande HTTP-anropets
+   felmarkerade span (`Polly.CircuitBreaker.BrokenCircuitException` som
+   `error.type`-tagg på efterföljande snabbt-avvisade anrop). Skärmdump
+   i README — den var poängen med hela övningen.
+4. Loggkorrelation bekräftad på riktigt: `kubectl logs deployment/orders-service`
+   innehöll en rad från Pollys egen `ILogger`-kategori `"Polly"`
+   ("Resilience event occurred. EventName: 'OnCircuitOpened'...") med
+   `"trace_id":"9faf876a505305b0ff35e663c884856a"` i loggens scope —
+   exakt samma trace-ID som Jaeger visade för samma händelse (kortformen
+   `9faf876` i Jaeger UI:ts titel).
+5. `kubectl scale deployment/inventory-service --replicas=1`, väntade in
+   rollout. Ny order gav ett rent domän-409 ("insufficient stock" — inte
+   ett 503) för en oseedad artikel, vilket bekräftar att hela kedjan
+   (inklusive Polly-pipelinen) återhämtade sig utan manuell inblandning,
+   samma mönster som i tidigare steg.
+
+Nästa steg: steg 6 del 2 (metrics — OpenTelemetry-mätvärden, ev.
+Prometheus/Grafana), sedan steg 7 (tredje tjänsten + meddelandebuss).

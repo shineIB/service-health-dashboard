@@ -70,6 +70,11 @@ kubectl -n service-health-dashboard apply \
 kubectl -n service-health-dashboard rollout status deployment/orders-postgres
 kubectl -n service-health-dashboard rollout status deployment/inventory-postgres
 
+# Jaeger (traces UI) — nothing blocks on it being up first, a missing OTLP
+# endpoint just means empty traces, but it needs to exist eventually
+kubectl -n service-health-dashboard apply -f k8s/jaeger/deployment.yaml -f k8s/jaeger/service.yaml
+kubectl -n service-health-dashboard rollout status deployment/jaeger
+
 # Migrations run as one-shot Jobs, not on pod startup — see "Architecture decisions" below
 kubectl -n service-health-dashboard apply -f k8s/orders-service/migration-job.yaml -f k8s/inventory-service/migration-job.yaml
 kubectl -n service-health-dashboard wait --for=condition=complete job/orders-migrate --timeout=120s
@@ -88,6 +93,9 @@ kubectl -n service-health-dashboard rollout status deployment/dashboard-service
 # Opens a tunnel and prints a URL — on the Docker driver (Windows/macOS) this blocks
 # and needs its terminal left open for the tunnel to stay up
 minikube service dashboard-service -n service-health-dashboard
+
+# Same for Jaeger's UI, in another terminal
+minikube service jaeger -n service-health-dashboard
 ```
 
 ### Troubleshooting: `minikube image load` silently keeping a stale image
@@ -129,6 +137,18 @@ Status is coded in shape and color together — a solid pill with a checkmark fo
 
 ![Dashboard showing inventory-service unreachable](docs/screenshots/dashboard-unreachable.jpg)
 
+## Distributed tracing
+
+OpenTelemetry traces every request across both services that talk to each other over HTTP — orders-service's own request, the outbound call into inventory-service, and both services' Postgres queries — using the standard W3C `traceparent` header, no custom propagation code required. Retries and circuit-breaker state changes from the Polly v8 resilience pipeline show up as their own spans, not just log lines. Traces go to Jaeger (`k8s/jaeger`) over OTLP; every log line is enriched with `trace_id`/`span_id` so a log can be followed straight to its trace in Jaeger.
+
+**A complete order** — `POST /orders` on orders-service, the resilient call into inventory-service, the manual `inventory.reserve` span (tagged with the order and product IDs), and both services' Postgres queries, all in one trace:
+
+![A complete trace from orders-service through inventory-service to Postgres](docs/screenshots/jaeger-trace-orders-to-inventory.jpg)
+
+**`inventory-service` scaled to 0 replicas** — the same call now shows `OnRetry`, the circuit breaker's `OnCircuitOpened` event, and the failed HTTP attempt underneath it, all inside the trace instead of scattered across log lines:
+
+![A trace showing retry attempts and the circuit breaker opening](docs/screenshots/jaeger-trace-retry-circuit-breaker.jpg)
+
 ## Architecture decisions
 
 **Fail-closed, not optimistic.** `orders-service` rejects an order it can't confirm stock for, rather than accepting it and reconciling later. The alternative — accept now, settle later — was rejected because overselling is more expensive to unwind than a customer seeing a retryable `503`. Backed by a Polly v8 resilience pipeline (timeout, retry with backoff + jitter, circuit breaker) that only retries transient failures, never a `409` (insufficient stock) or `404`.
@@ -143,7 +163,7 @@ Status is coded in shape and color together — a solid pill with a checkmark fo
 
 ## Not done yet
 
-- **Observability (step 6).** No OpenTelemetry traces/metrics, no structured logging, no Prometheus/Grafana. Right now the only signal is the health/version data the dashboard already shows.
+- **Metrics (step 6, part 2).** Distributed tracing and structured logging are done — see "Distributed tracing" above. OpenTelemetry metrics and a Prometheus/Grafana stack are not; the only quantitative signal beyond traces today is the health/version data the dashboard already shows.
 - **A third service and a real message bus (step 7).** `notifications-service` doesn't exist yet; orders→inventory is the only inter-service call, and it's synchronous HTTP, not events. Deferred deliberately — see `CLAUDE.md` for why the bus comes after two services are stable, not before.
 - **CI/CD (step 8).** Everything above is built and deployed by hand (`docker build`, `minikube image load`, `kubectl apply`). No GitHub Actions pipeline yet for build/test/image push, let alone auto-deploy.
 

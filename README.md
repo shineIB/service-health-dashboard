@@ -2,7 +2,9 @@
 
 [![CI](https://github.com/shineIB/service-health-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/shineIB/service-health-dashboard/actions/workflows/ci.yml)
 
-A small e-commerce backend built to demonstrate *running* a microservice system, not just writing one. Orders and inventory coordinate over HTTP with real failure handling (timeouts, retries, circuit breaking, idempotency); orders-service publishes order-lifecycle events over RabbitMQ that notifications-service consumes independently; all three run in Kubernetes and are watched by a fourth service that reports their live health, version, and deploy info without ever depending on them staying up.
+A small e-commerce backend built to demonstrate *running* a microservice system, not just writing one — three .NET services on Kubernetes, watched by a fourth that reports their live health without ever depending on them staying up.
+
+Orders and inventory coordinate over HTTP with real failure handling (timeouts, retries, circuit breaking, idempotency); orders-service publishes order-lifecycle events over RabbitMQ that notifications-service consumes independently; `dashboard-service` polls all three and serves a small React SPA showing what it finds.
 
 ## Architecture
 
@@ -24,14 +26,15 @@ graph LR
     User -- "minikube service" --> Dashboard
     Dashboard -. "poll /health/ready + /version every 5s" .-> Orders
     Dashboard -. "poll /health/ready + /version every 5s" .-> Inventory
+    Dashboard -. "poll /health/ready + /version every 5s" .-> Notifications
     Orders -- "reserve / release stock (resilient HTTP)" --> Inventory
-    Orders -- "publish order.created/confirmed/cancelled (best-effort)" --> RabbitMQ
+    Orders -- "outbox: order.created/confirmed/cancelled" --> RabbitMQ
     RabbitMQ -- "consume order.*" --> Notifications
     Orders --> OrdersDB
     Inventory --> InventoryDB
 ```
 
-`orders-service` validates and reserves stock in `inventory-service` synchronously before accepting an order, then publishes an event over RabbitMQ — best-effort, never blocking the order itself. `notifications-service` consumes those events independently and logs a simulated confirmation. `dashboard-service` polls orders/inventory on its own schedule and serves a small React SPA showing what it finds — it never proxies a browser request into either service.
+`orders-service` validates and reserves stock in `inventory-service` synchronously before accepting an order, then stages an event in the same Postgres transaction as the order itself — a background dispatcher publishes it to RabbitMQ afterwards, so the order never waits on the broker (see "Events" below). `notifications-service` consumes those events independently and logs a simulated confirmation. `dashboard-service` polls all three on its own schedule and serves a small React SPA showing what it finds — it never proxies a browser request into any of them.
 
 ## Run it yourself
 
@@ -51,9 +54,12 @@ docker compose up --build
 
 ### Kubernetes (minikube)
 
-Everything lives in the `service-health-dashboard` namespace — pass `-n service-health-dashboard` (or `kubectl -n service-health-dashboard ...`) for every command below.
+Everything lives in the `service-health-dashboard` namespace — pass `-n service-health-dashboard` (or `kubectl -n service-health-dashboard ...`) for every command below. Standalone from the Docker Compose section above — clone first if you haven't already:
 
 ```bash
+git clone https://github.com/shineIB/service-health-dashboard.git
+cd service-health-dashboard
+
 # Build and load the four images (no external registry)
 # GIT_SHA/BUILD_TIME are baked in as build args so the dashboard's "version"
 # column shows something other than "unknown" — see Dockerfile comments.
@@ -83,8 +89,8 @@ kubectl -n service-health-dashboard rollout status deployment/orders-postgres
 kubectl -n service-health-dashboard rollout status deployment/inventory-postgres
 
 # Jaeger (traces UI) and RabbitMQ — nothing blocks on either being up first (orders-service's
-# publish is best-effort, notifications-service retries its own initial connect), but they
-# need to exist before the services that depend on them start doing anything useful with them
+# outbox dispatcher and notifications-service's consumer both retry their own connection), but
+# they need to exist before the services that depend on them start doing anything useful with them
 kubectl -n service-health-dashboard apply -f k8s/jaeger/deployment.yaml -f k8s/jaeger/service.yaml
 kubectl -n service-health-dashboard apply -f k8s/rabbitmq/deployment.yaml -f k8s/rabbitmq/service.yaml
 kubectl -n service-health-dashboard rollout status deployment/jaeger
@@ -107,7 +113,7 @@ kubectl -n service-health-dashboard rollout status deployment/inventory-service
 kubectl -n service-health-dashboard rollout status deployment/notifications-service
 kubectl -n service-health-dashboard rollout status deployment/dashboard-service
 
-# Prometheus (scrapes the three app pods above via their prometheus.io/* annotations —
+# Prometheus (scrapes the four app pods above via their prometheus.io/* annotations —
 # see "Metrics dashboards" below) and Grafana (dashboard provisioned from k8s/grafana/, not
 # clicked together by hand)
 kubectl -n service-health-dashboard apply \
@@ -119,16 +125,29 @@ kubectl -n service-health-dashboard apply \
   -f k8s/grafana/datasource-configmap.yaml -f k8s/grafana/dashboard-provider-configmap.yaml \
   -f k8s/grafana/dashboard-configmap.yaml -f k8s/grafana/deployment.yaml -f k8s/grafana/service.yaml
 kubectl -n service-health-dashboard rollout status deployment/grafana
+```
 
-# Opens a tunnel and prints a URL — on the Docker driver (Windows/macOS) this blocks
-# and needs its terminal left open for the tunnel to stay up
+### Opening the UIs
+
+Each of these opens a tunnel and blocks the terminal it runs in — on the Docker driver (Windows/macOS) `minikube service` doesn't return, it just prints a URL and waits. **Run each in its own terminal window**, not appended to the block above: pasting all five into one terminal only gets you the first tunnel, since the rest of the paste just sits unread until you `Ctrl+C` it.
+
+```bash
 minikube service dashboard-service -n service-health-dashboard
+```
 
-# Same for Jaeger's UI, RabbitMQ's management UI, Prometheus's UI, and Grafana, each in
-# their own terminal
+```bash
 minikube service jaeger -n service-health-dashboard
+```
+
+```bash
 minikube service rabbitmq -n service-health-dashboard
+```
+
+```bash
 minikube service prometheus -n service-health-dashboard
+```
+
+```bash
 minikube service grafana -n service-health-dashboard
 ```
 
@@ -183,9 +202,9 @@ application itself.
 
 Status is coded in shape and color together — a solid pill with a checkmark for Healthy, solid amber with a warning triangle for Unhealthy, and a **dashed, hollow** pill with a slash for Unreachable, so "didn't respond at all" never looks like a shade of "responded but sick." Version, response time, and last-successful-check are all live and update every 5 seconds.
 
-**Healthy** — both services up:
+**Healthy** — all three monitored services up:
 
-![Dashboard showing both services healthy](docs/screenshots/dashboard-healthy.jpg)
+![Dashboard showing orders-service, inventory-service, and notifications-service all healthy](docs/screenshots/dashboard-healthy.jpg)
 
 **`inventory-service` scaled to 0 replicas** — the dashboard marks it `Unreachable` (not "red like Unhealthy"), keeps its last-known version and shows *when* it was last seen, while `orders-service` and the dashboard itself stay unaffected:
 
@@ -193,7 +212,7 @@ Status is coded in shape and color together — a solid pill with a checkmark fo
 
 ## Distributed tracing
 
-OpenTelemetry traces every request across both services that talk to each other over HTTP — orders-service's own request, the outbound call into inventory-service, and both services' Postgres queries — using the standard W3C `traceparent` header, no custom propagation code required. Retries and circuit-breaker state changes from the Polly v8 resilience pipeline show up as their own spans, not just log lines. Traces go to Jaeger (`k8s/jaeger`) over OTLP; every log line is enriched with `trace_id`/`span_id` so a log can be followed straight to its trace in Jaeger.
+OpenTelemetry traces every request across the services that talk to each other over HTTP — orders-service's own request, the outbound call into inventory-service, and both services' Postgres queries — using the standard W3C `traceparent` header, no custom propagation code required. Retries and circuit-breaker state changes from the Polly v8 resilience pipeline show up as their own spans, not just log lines. The RabbitMQ side gets the same treatment even though there's no HTTP call to propagate a header over: `OutboxDispatcher` wraps each publish in its own `order.publish-event` span (tagged with the outbox message id and routing key), and `notifications-service` wraps each consumed message in `notifications.handle-event` (tagged with the event id and type) — so a trace can show "this order's event was staged, published some time later once RabbitMQ was reachable, and consumed here" even though the two ends never share an HTTP request. Traces go to Jaeger (`k8s/jaeger`) over OTLP; every log line is enriched with `trace_id`/`span_id` so a log can be followed straight to its trace in Jaeger.
 
 **A complete order** — `POST /orders` on orders-service, the resilient call into inventory-service, the manual `inventory.reserve` span (tagged with the order and product IDs), and both services' Postgres queries, all in one trace:
 
@@ -205,18 +224,23 @@ OpenTelemetry traces every request across both services that talk to each other 
 
 ## Metrics
 
-All three services expose OpenTelemetry metrics at `GET /metrics` in Prometheus text format — ASP.NET Core/HttpClient request counts and latency histograms for free from auto-instrumentation, plus a handful of business counters for the outcomes that matter: `orders_created_total`, `orders_rejected_total` (tagged `reason=insufficient_stock|inventory_unavailable`), `orders_cancelled_total` on orders-service; `inventory_reservations_succeeded_total`, `inventory_reservations_failed_total` (tagged `reason=insufficient_stock`), `inventory_releases_total` on inventory-service.
+All four services expose OpenTelemetry metrics at `GET /metrics` in Prometheus text format — ASP.NET Core/HttpClient request counts and latency histograms for free from auto-instrumentation, plus a handful of business counters for the outcomes that matter:
+
+- **orders-service:** `orders_created_total`, `orders_rejected_total` (tagged `reason=insufficient_stock|inventory_unavailable`), `orders_cancelled_total`, and the outbox's own `orders_events_published_total`, `orders_events_publish_failed_total`, `orders_events_publish_abandoned_total` (tagged `event_type`) — see "Events" below for what "abandoned" means.
+- **inventory-service:** `inventory_reservations_succeeded_total`, `inventory_reservations_failed_total` (tagged `reason=insufficient_stock`), `inventory_releases_total`.
+- **notifications-service:** `notifications_sent_total`, `notifications_failed_total` (tagged `reason`), and `notifications_duplicate_total` — a redelivered event being acked without a second confirmation, not a failure.
 
 Pull-based (scraped, not pushed over OTLP) — Jaeger only understands traces, and OTLP metric export needs something to receive it. Try it against the Docker Compose stack:
 
 ```bash
 curl http://localhost:8080/metrics | grep orders_
 curl http://localhost:8081/metrics | grep inventory_
+curl http://localhost:8083/metrics | grep notifications_
 ```
 
 ## Metrics dashboards (Prometheus + Grafana)
 
-In `k8s/`, not Docker Compose — this is infrastructure, not application code, and minikube is where it earns its keep. Prometheus discovers what to scrape via `kubernetes_sd_configs` (pod role) plus `prometheus.io/scrape`/`port`/`path` annotations already on orders-service/inventory-service/dashboard-service's Deployments (`k8s/prometheus/configmap.yaml`) — a fourth service added later gets picked up the moment its Deployment carries the same annotations, no target list to maintain by hand.
+In `k8s/`, not Docker Compose — this is infrastructure, not application code, and minikube is where it earns its keep. Prometheus discovers what to scrape via `kubernetes_sd_configs` (pod role) plus `prometheus.io/scrape`/`port`/`path` annotations on every Deployment — orders-service, inventory-service, notifications-service, and dashboard-service all carry them (`k8s/prometheus/configmap.yaml`). That's not hypothetical: notifications-service was added after this scrape config was written, and it started showing up in Prometheus's targets the moment its Deployment rolled out — no change to the ConfigMap needed. That's the actual point of annotation-based discovery over a hand-maintained target list, demonstrated by a real fourth service, not just asserted.
 
 **Grafana's datasource and dashboard are provisioned as code** — two ConfigMaps (`k8s/grafana/datasource-configmap.yaml`, `k8s/grafana/dashboard-configmap.yaml`), not clicked together in the UI (`GF_AUTH_ANONYMOUS_ENABLED=true` even makes the UI read-only for exactly that reason — see `k8s/grafana/deployment.yaml`). A dashboard that only exists because someone built it by hand in the running pod disappears with that pod and was never in git; provisioning from a ConfigMap means the dashboard *is* version-controlled, and `kubectl apply` rebuilds it identically on a fresh cluster.
 
@@ -254,6 +278,8 @@ Both gaps are the same trade-off from two angles: this is safe **only** because 
 
 GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR to `master`: restore, build, test the whole solution, then build all four service images (catches a broken Dockerfile early). On a push to `master` specifically — not on PRs — a separate job also **publishes** those four images to GitHub Container Registry, tagged with both the short git SHA and `latest`, built with the same `GIT_SHA`/`BUILD_TIME` build args as the local `docker build` commands above so a published image's `/version` endpoint shows a real commit and build time, not `"unknown"`.
 
+If any job fails on a push to `master`, a final job opens a GitHub issue (labeled `ci-failure`, linking straight to the run) instead of relying on the CI badge above being the only signal — there's no public API for the personal "notify me on failed Actions" account setting, so an open issue on the repo itself is the automatable equivalent.
+
 ### Pulling published images
 
 ```bash
@@ -279,6 +305,8 @@ GHCR packages are public for this repo — no `docker login` needed to pull.
 **Idempotency via order ID.** Every stock reservation is keyed by the order's ID, so a retried request — including the resilience pipeline's own retries — can't double-reserve. The alternative, trusting the caller to never retry, doesn't hold once you've added retries yourself.
 
 **TTL instead of compensating release.** A reservation expires on its own via a background sweep in `inventory-service`, instead of `orders-service` issuing a compensating "release" call when something fails downstream. A saga/compensating-transaction approach was rejected because the compensating call would go through the very service that may be the reason things are failing — TTL doesn't depend on anything else being reachable.
+
+**Transactional outbox instead of publishing directly to RabbitMQ.** An order-lifecycle event is written to an `OutboxMessages` row in the same Postgres transaction as the order change itself, and a separate background dispatcher publishes it afterwards — `orders-service` never calls RabbitMQ from the request path at all. The alternative — publish directly to RabbitMQ right after the commit, catching and logging any failure so it could never fail the order — is simpler and was this project's first version (see git history), but has one real gap: a crash in the narrow window between the DB commit and the publish call loses that one event permanently, with nothing left anywhere to retry from. The outbox closes that gap by making the write itself the durable record, at the cost of a table, a migration, and a poll loop. See "Events" below for the full mechanics, including the bounded-retry/dead-letter handling on both ends.
 
 **`/health/live` vs. `/health/ready`.** Live has no dependencies and is always healthy if the process is running; ready checks the database. Kubernetes uses live for restart decisions and ready for traffic routing. A single combined endpoint was rejected because it would turn a brief database hiccup into an unnecessary pod restart instead of just a short pause in traffic.
 

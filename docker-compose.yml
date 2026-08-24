@@ -131,10 +131,13 @@ services:
       MonitoredServices__Services__0__BaseUrl: "http://orders-service:8080"
       MonitoredServices__Services__1__Name: "inventory-service"
       MonitoredServices__Services__1__BaseUrl: "http://inventory-service:8080"
+      MonitoredServices__Services__2__Name: "notifications-service"
+      MonitoredServices__Services__2__BaseUrl: "http://notifications-service:8080"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
     depends_on:
       - orders-service
       - inventory-service
+      - notifications-service
       - jaeger
 
 volumes:

@@ -1,5 +1,5 @@
 # No Secret, no PVC, no migration Job: dashboard-service has no database of its own —
-# it only polls the other two services' /health/ready and /version over HTTP.
+# it only polls the other three services' /health/ready and /version over HTTP.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,6 +39,10 @@ spec:
               value: "inventory-service"
             - name: MonitoredServices__Services__1__BaseUrl
               value: "http://inventory-service:8080"
+            - name: MonitoredServices__Services__2__Name
+              value: "notifications-service"
+            - name: MonitoredServices__Services__2__BaseUrl
+              value: "http://notifications-service:8080"
             # Read directly by the OTel SDK — no typed options class needed for a standard,
             # spec-defined OTel env var. See k8s/jaeger and CLAUDE.md.
             - name: OTEL_EXPORTER_OTLP_ENDPOINT

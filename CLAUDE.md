@@ -1385,8 +1385,120 @@ produktionskod, men samma lärdom: en ny factory måste medvetet kopiera ALLA
 beroenden den föregående factoryn redan fejkade, inte bara den man för
 tillfället bryr sig om.
 
-Nästa steg: steg 8 kvarstår redan löst (CI klart sedan tidigare) — nästa
-naturliga arbete är antingen CD (auto-deploy) eller någon av de mindre
-uppföljningarna som redan är noterade (notifications-/outbox-paneler i
-Grafana, k8s-native service discovery för dashboard, SSE/WebSocket istället
-för polling).
+## Steg 8, CD-halvan — publicera images till GHCR. Klart och verifierat.
+
+CI-halvan av steg 8 var redan klar sedan tidigare (se ovan). Den här delen
+lägger till bygg-och-publicera, medvetet **inte** auto-deploy — se beslutet
+nedan för varför det senare inte bara är "inte gjort än" utan faktiskt
+inte möjligt mot den här projektets egna minikube-mål utan en annan sorts
+infrastruktur.
+
+**Beslut:**
+
+- **Alla fyra tjänstavbilder till GHCR, inte bara de tre domän-
+  mikrotjänsterna.** Den ursprungliga instruktionen sa "alla tre images",
+  men `docker-build`-jobbet byggde redan `dashboard-service` sedan
+  tidigare (och saknade faktiskt `notifications-service` i sin matris —
+  ett kvarglömt hål sedan tjänsten lades till i steg 7, hittat och fixat
+  i samma veva). Att publicera tre av fyra redan byggda images hade varit
+  mer förvirrande än konsekvent — samma "bygg allt som redan byggs"-linje.
+- **Taggar: kort git-SHA (samma `git rev-parse --short HEAD`-stil som
+  lokala `docker build`-kommandon i README) + `latest`.** Inte den fulla
+  40-tecken-SHA:n `github.sha` ger — konsekvent med hur `/version` redan
+  visar `@6f310da`-stil korta hashar i dashboarden.
+- **`permissions: packages: write` scopeat till `docker-publish`-jobbet,
+  inte hela workflowen.** Samma minsta-privilegium-linje som Prometheus
+  fick en namespacad `Role` istället för en `ClusterRole` i steg 6 del 3
+  — `build-and-test`- och `docker-build`-jobben behöver aldrig skriva
+  till GHCR.
+- **Publicera bara vid push till `master`, aldrig på en pull_request.**
+  En `GITHUB_TOKEN` på en PR från en fork saknar ändå
+  package-write-behörighet, och en PR ska inte publicera en image oavsett
+  — `if: github.event_name == 'push' && github.ref == 'refs/heads/master'`.
+- **`docker-publish` beror på både `build-and-test` OCH `docker-build`**,
+  inte bara på testerna — ingen anledning att slösa ett registry-push på
+  en image vars Dockerfile redan är känd trasig.
+- **Owner-namnet lowercased explicit i ett eget steg** (`tr '[:upper:]'
+  '[:lower:]'`) — `github.repository_owner` bevarar kontots faktiska
+  skiftläge (`ShineIB`), men GHCR-image-sökvägar måste vara helt
+  gemener. Verifierat genom att faktiskt läsa `Build__GitSha`/
+  `Build__BuildTimeUtc` ur en publicerad image (se nedan) — hade
+  owner-lowercasingen varit fel hade hela push-steget failat med ett
+  ogiltigt repository-namn, inte bara gett fel taggar.
+
+**Beslut — inget auto-deploy, och varför det inte bara är
+"inte prioriterat":** allt under "Kubernetes (minikube)" i README körs mot
+ett `minikube`-kluster som lever på den här maskinens egen Docker Desktop/
+Hyper-V. En GitHub-hostad runner har ingen nätverksväg dit, ingen
+`kubeconfig` för det, och inget värt att ge en även om den hade — minikube
+är avsiktligt inte nåbart från internet. Pipelinen slutar därför vid "en
+image finns i GHCR som `kubectl`/`minikube image load` kan använda näst" —
+att dra in den i minikube och rulla om Deploymentsen är fortfarande samma
+manuella `kubectl apply`/`minikube image load`-sekvens som redan är
+dokumenterad. Att låtsas motsatsen — en grön bock som antyder "och nu är
+det live" — hade varit missvisande om vad som faktiskt hände. En riktig
+CD-lösning skulle behöva ett kluster GitHub Actions faktiskt kan nå (ett
+molnhostat kluster, eller en self-hosted runner med nätverksväg till den
+här maskinen) plus något som driver utrullningen — en annan sorts
+infrastruktur än "kör det på min bärbara dator", inte ett saknat
+workflow-steg.
+
+**Upptäckt under verifiering — två riktiga CI-buggar, inga lokala repron.**
+`gh run watch` på de två föregående pusharna (steg 7.6-fixen och den här)
+visade att CI:t faktiskt varit **rött i två körningar i rad redan innan
+den här sessionens första push i den här omgången** — något jag inte hade
+upptäckt om jag bara litat på lokala `dotnet test`-körningar (alla gröna,
+varje gång). Grundorsaken båda gångerna:
+`NotificationsService.Api.Tests.MetricsEndpointTests.Metrics_ReturnsPrometheusTextExposingAspNetCoreInstrumentation`
+— den enda `/metrics`-testet i hela lösningen som INTE redan använde
+poll-tills-synligt-mönstret (`ScrapeMetricsUntilAsync`) som är
+väletablerat i systertesterna. Två separata fixförsök:
+1. Första fixen (använd den redan existerande `ScrapeMetricsUntilAsync`-
+   hjälparen, 5s poll) räckte inte — misslyckades igen, men den här gången
+   syntes `aspnetcore_routing_match_attempts_total`/`http_server_active_requests`
+   redan från den allra första requesten, medan `http_server_request_duration`
+   fortfarande saknades efter 5 sekunders upprepad `/metrics`-scraping
+   utan någon annan request emellan.
+2. **Slutsats:** duration-histogrammet registreras vid svarets
+   *avslut*, till skillnad från de andra två (registrerade vid start/
+   matchning) — att bara scrapea `/metrics` om och om igen genererar
+   aldrig en NY sådan mätning om den ursprungliga (från det enda
+   `/version`-anropet) gick förlorad i en tidig timing-lucka på en
+   belastad GitHub Actions-runner. **Fix:** loopen gör nu ett vanligt
+   `GET /version`-anrop varje pollningsvarv, inte bara ett omscrape av
+   `/metrics` — samma "generera färska händelser istället för att
+   förlita sig på en specifik, ev. förlorad mätning"-princip som redan
+   användes i `Metrics_AfterConsumingAnOrderCreatedEvent_...`-testet i
+   samma fil (som republicerar hela eventet varje varv, inte bara
+   omscrapear). Tidsgränsen höjdes samtidigt till 20s för marginal på en
+   belastad runner.
+**Lärdom:** `dotnet test` lokalt räcker inte som "verifierat" för allt —
+den lokala maskinen har mer marginal (färre samtidiga containrar/CPU-
+kontention) än en delad GitHub-hostad runner. Efter det här passet:
+kolla faktiskt `gh run list`/`gh run watch` efter en push som rör
+testkod, inte bara lokala körningar, innan man kallar något klart.
+**Kvarstående, medvetet inte svept nu:** `OrdersService.Api.Tests`/
+`InventoryService.Api.Tests`s motsvarande första `/metrics`-test gör
+fortfarande samma en-gångs-läsning (fungerar hittills, aldrig sett
+flaka i CI) — värt att svepa igenom om det någonsin visar samma symptom,
+men inte fixat i förebyggande syfte här.
+
+**Verifierat på riktigt:**
+1. `gh run watch` på den gröna körningen efter fixen ovan: `Build & test`,
+   alla fyra `Docker build (*)`-jobb, och alla fyra
+   `Publish * image`-jobb gröna.
+2. `docker pull ghcr.io/shineib/orders-service:latest` (och samma för
+   `inventory-service`/`notifications-service`/`dashboard-service`) —
+   lyckades utan `docker login`, bekräftar att paketen faktiskt är
+   publika, inte bara att workflowen rapporterade "success".
+3. `docker pull ghcr.io/shineib/orders-service:80c8720` (kort-SHA-taggen)
+   gav **samma digest** som `:latest` — bekräftar att båda taggarna
+   pekar på samma, riktiga image, inte två separata builds.
+4. `docker run --rm --entrypoint printenv ghcr.io/shineib/orders-service:latest`
+   visade `Build__GitSha=80c8720`/`Build__BuildTimeUtc=2026-08-24T12:42:11Z`
+   — riktiga värden bakade in av CI:t, inte `unknown`, och SHA:n matchar
+   exakt den commit som triggade den gröna körningen.
+
+Nästa steg: mindre uppföljningar som redan är noterade (notifications-/
+outbox-paneler i Grafana, k8s-native service discovery för dashboard,
+SSE/WebSocket istället för polling, alerting på övergivna outbox-rader).

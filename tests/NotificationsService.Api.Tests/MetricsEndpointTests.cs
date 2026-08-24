@@ -74,10 +74,13 @@ public class MetricsEndpointTests : IClassFixture<NotificationsApiFactory>
         var client = _factory.CreateClient();
         await client.GetAsync("/version");
 
-        var response = await client.GetAsync("/metrics");
+        // Same race as the other services' MetricsEndpointTests (see their comment): a request's
+        // http_server_request_duration measurement isn't always visible in the very next
+        // scrape — observed for real on GitHub Actions' runners (not just a theoretical race),
+        // where a one-shot scrape right after /version flaked twice in a row. Poll instead of
+        // asserting against a single read.
+        var body = await ScrapeMetricsUntilAsync(client, "http_server_request_duration");
 
-        response.StatusCode.Should().Be(HttpStatusCode.OK);
-        var body = await response.Content.ReadAsStringAsync();
         body.Should().Contain("http_server_request_duration");
     }
 

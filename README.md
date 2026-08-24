@@ -6,6 +6,8 @@ A small e-commerce backend built to demonstrate *running* a microservice system,
 
 Orders and inventory coordinate over HTTP with real failure handling (timeouts, retries, circuit breaking, idempotency); orders-service publishes order-lifecycle events over RabbitMQ that notifications-service consumes independently; `dashboard-service` polls all three and serves a small React SPA showing what it finds.
 
+**.NET 9 · EF Core · PostgreSQL · RabbitMQ · OpenTelemetry · Kubernetes · React**
+
 ## Architecture
 
 ```mermaid
@@ -36,6 +38,34 @@ graph LR
 
 `orders-service` validates and reserves stock in `inventory-service` synchronously before accepting an order, then stages an event in the same Postgres transaction as the order itself — a background dispatcher publishes it to RabbitMQ afterwards, so the order never waits on the broker (see "Events" below). `notifications-service` consumes those events independently and logs a simulated confirmation. `dashboard-service` polls all three on its own schedule and serves a small React SPA showing what it finds — it never proxies a browser request into any of them.
 
+## The dashboard
+
+Status is coded in shape and color together — a solid pill with a checkmark for Healthy, solid amber with a warning triangle for Unhealthy, and a **dashed, hollow** pill with a slash for Unreachable, so "didn't respond at all" never looks like a shade of "responded but sick." Version, response time, and last-successful-check are all live and update every 5 seconds.
+
+**Healthy** — all three monitored services up:
+
+![Dashboard showing orders-service, inventory-service, and notifications-service all healthy](docs/screenshots/dashboard-healthy.jpg)
+
+**`inventory-service` scaled to 0 replicas** — the dashboard marks it `Unreachable` (not "red like Unhealthy"), keeps its last-known version and shows *when* it was last seen, while `orders-service` and the dashboard itself stay unaffected:
+
+![Dashboard showing inventory-service unreachable](docs/screenshots/dashboard-unreachable.jpg)
+
+## Architecture decisions
+
+**Fail-closed, not optimistic.** `orders-service` rejects an order it can't confirm stock for, rather than accepting it and reconciling later. The alternative — accept now, settle later — was rejected because overselling is more expensive to unwind than a customer seeing a retryable `503`. Backed by a Polly v8 resilience pipeline (timeout, retry with backoff + jitter, circuit breaker) that only retries transient failures, never a `409` (insufficient stock) or `404`.
+
+**Idempotency via order ID.** Every stock reservation is keyed by the order's ID, so a retried request — including the resilience pipeline's own retries — can't double-reserve. The alternative, trusting the caller to never retry, doesn't hold once you've added retries yourself.
+
+**TTL instead of compensating release.** A reservation expires on its own via a background sweep in `inventory-service`, instead of `orders-service` issuing a compensating "release" call when something fails downstream. A saga/compensating-transaction approach was rejected because the compensating call would go through the very service that may be the reason things are failing — TTL doesn't depend on anything else being reachable.
+
+**Transactional outbox instead of publishing directly to RabbitMQ.** An order-lifecycle event is written to an `OutboxMessages` row in the same Postgres transaction as the order change itself, and a separate background dispatcher publishes it afterwards — `orders-service` never calls RabbitMQ from the request path at all. The alternative — publish directly to RabbitMQ right after the commit, catching and logging any failure so it could never fail the order — is simpler and was this project's first version (see git history), but has one real gap: a crash in the narrow window between the DB commit and the publish call loses that one event permanently, with nothing left anywhere to retry from. The outbox closes that gap by making the write itself the durable record, at the cost of a table, a migration, and a poll loop. See "Events" below for the full mechanics, including the bounded-retry/dead-letter handling on both ends.
+
+**`/health/live` vs. `/health/ready`.** Live has no dependencies and is always healthy if the process is running; ready checks the database. Kubernetes uses live for restart decisions and ready for traffic routing. A single combined endpoint was rejected because it would turn a brief database hiccup into an unnecessary pod restart instead of just a short pause in traffic.
+
+**notifications-service has no database, on purpose.** Its only job is reacting to events it doesn't own — adding a database just to store a dedupe set (see "Events" below) would mean a fourth Postgres instance, a fourth migration story, and a fourth thing that can be down, for a service whose entire value is being simple and disposable. The in-memory idempotency store is the direct consequence of that choice, not an oversight.
+
+**The dashboard can't inherit anyone else's outage.** `dashboard-service`'s own `/health/ready` has zero registered checks, so it's structurally incapable of reporting unhealthy because a service it watches is down — confirmed above by scaling `inventory-service` to 0 while the dashboard stayed `Ready`. Tying its health to the services it monitors was rejected because that's exactly the tool you need most during an actual incident.
+
 ## Run it yourself
 
 ### Docker Compose
@@ -54,161 +84,7 @@ docker compose up --build
 
 ### Kubernetes (minikube)
 
-Everything lives in the `service-health-dashboard` namespace — pass `-n service-health-dashboard` (or `kubectl -n service-health-dashboard ...`) for every command below. Standalone from the Docker Compose section above — clone first if you haven't already:
-
-```bash
-git clone https://github.com/shineIB/service-health-dashboard.git
-cd service-health-dashboard
-
-# Build and load the four images (no external registry)
-# GIT_SHA/BUILD_TIME are baked in as build args so the dashboard's "version"
-# column shows something other than "unknown" — see Dockerfile comments.
-GIT_SHA=$(git rev-parse --short HEAD)
-BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-docker build -t orders-service:local        -f src/OrdersService/OrdersService.Api/Dockerfile        --build-arg GIT_SHA=$GIT_SHA --build-arg BUILD_TIME=$BUILD_TIME .
-docker build -t inventory-service:local     -f src/InventoryService/InventoryService.Api/Dockerfile     --build-arg GIT_SHA=$GIT_SHA --build-arg BUILD_TIME=$BUILD_TIME .
-docker build -t notifications-service:local -f src/NotificationsService/NotificationsService.Api/Dockerfile --build-arg GIT_SHA=$GIT_SHA --build-arg BUILD_TIME=$BUILD_TIME .
-docker build -t dashboard-service:local     -f src/DashboardService/DashboardService.Api/Dockerfile     --build-arg GIT_SHA=$GIT_SHA --build-arg BUILD_TIME=$BUILD_TIME .
-
-minikube start
-minikube image load orders-service:local
-minikube image load inventory-service:local
-minikube image load notifications-service:local
-minikube image load dashboard-service:local
-
-# Namespace, then Postgres (Deployment + PVC) for both services
-kubectl apply -f k8s/namespace.yaml
-kubectl -n service-health-dashboard apply \
-  -f k8s/orders-service/postgres-secret.yaml -f k8s/orders-service/postgres-pvc.yaml \
-  -f k8s/orders-service/postgres-deployment.yaml -f k8s/orders-service/postgres-service.yaml \
-  -f k8s/inventory-service/postgres-secret.yaml -f k8s/inventory-service/postgres-pvc.yaml \
-  -f k8s/inventory-service/postgres-deployment.yaml -f k8s/inventory-service/postgres-service.yaml \
-  -f k8s/orders-service/secret.yaml -f k8s/inventory-service/secret.yaml
-
-kubectl -n service-health-dashboard rollout status deployment/orders-postgres
-kubectl -n service-health-dashboard rollout status deployment/inventory-postgres
-
-# Jaeger (traces UI) and RabbitMQ — nothing blocks on either being up first (orders-service's
-# outbox dispatcher and notifications-service's consumer both retry their own connection), but
-# they need to exist before the services that depend on them start doing anything useful with them
-kubectl -n service-health-dashboard apply -f k8s/jaeger/deployment.yaml -f k8s/jaeger/service.yaml
-kubectl -n service-health-dashboard apply -f k8s/rabbitmq/deployment.yaml -f k8s/rabbitmq/service.yaml
-kubectl -n service-health-dashboard rollout status deployment/jaeger
-kubectl -n service-health-dashboard rollout status deployment/rabbitmq
-
-# Migrations run as one-shot Jobs, not on pod startup — see "Architecture decisions" below
-kubectl -n service-health-dashboard apply -f k8s/orders-service/migration-job.yaml -f k8s/inventory-service/migration-job.yaml
-kubectl -n service-health-dashboard wait --for=condition=complete job/orders-migrate --timeout=120s
-kubectl -n service-health-dashboard wait --for=condition=complete job/inventory-migrate --timeout=120s
-
-# The services themselves, plus the dashboard
-kubectl -n service-health-dashboard apply \
-  -f k8s/orders-service/deployment.yaml -f k8s/orders-service/service.yaml \
-  -f k8s/inventory-service/deployment.yaml -f k8s/inventory-service/service.yaml \
-  -f k8s/notifications-service/deployment.yaml -f k8s/notifications-service/service.yaml \
-  -f k8s/dashboard-service/deployment.yaml -f k8s/dashboard-service/service.yaml
-
-kubectl -n service-health-dashboard rollout status deployment/orders-service
-kubectl -n service-health-dashboard rollout status deployment/inventory-service
-kubectl -n service-health-dashboard rollout status deployment/notifications-service
-kubectl -n service-health-dashboard rollout status deployment/dashboard-service
-
-# Prometheus (scrapes the four app pods above via their prometheus.io/* annotations —
-# see "Metrics dashboards" below) and Grafana (dashboard provisioned from k8s/grafana/, not
-# clicked together by hand)
-kubectl -n service-health-dashboard apply \
-  -f k8s/prometheus/rbac.yaml -f k8s/prometheus/configmap.yaml \
-  -f k8s/prometheus/deployment.yaml -f k8s/prometheus/service.yaml
-kubectl -n service-health-dashboard rollout status deployment/prometheus
-
-kubectl -n service-health-dashboard apply \
-  -f k8s/grafana/datasource-configmap.yaml -f k8s/grafana/dashboard-provider-configmap.yaml \
-  -f k8s/grafana/dashboard-configmap.yaml -f k8s/grafana/deployment.yaml -f k8s/grafana/service.yaml
-kubectl -n service-health-dashboard rollout status deployment/grafana
-```
-
-### Opening the UIs
-
-Each of these opens a tunnel and blocks the terminal it runs in — on the Docker driver (Windows/macOS) `minikube service` doesn't return, it just prints a URL and waits. **Run each in its own terminal window**, not appended to the block above: pasting all five into one terminal only gets you the first tunnel, since the rest of the paste just sits unread until you `Ctrl+C` it.
-
-```bash
-minikube service dashboard-service -n service-health-dashboard
-```
-
-```bash
-minikube service jaeger -n service-health-dashboard
-```
-
-```bash
-minikube service rabbitmq -n service-health-dashboard
-```
-
-```bash
-minikube service prometheus -n service-health-dashboard
-```
-
-```bash
-minikube service grafana -n service-health-dashboard
-```
-
-**Reapplying `k8s/grafana/dashboard-configmap.yaml` after editing the dashboard JSON needs a
-pod restart to take effect** (`kubectl -n service-health-dashboard rollout restart
-deployment/grafana`) — it's mounted with `subPath`, and kubelet does not live-update `subPath`
-ConfigMap mounts the way it does whole-directory mounts.
-
-### Troubleshooting: `minikube image load` silently keeping a stale image
-
-All four images are tagged with a fixed tag (`:local`), not a per-build tag
-like a git SHA — deliberate for a local dev loop, but it has a sharp edge:
-after you rebuild an image (`docker build -t orders-service:local ...`) and
-run `minikube image load orders-service:local` again, the node can keep
-serving the *old* image contents under that same tag. Combined with
-`imagePullPolicy: IfNotPresent` on every Deployment (see "Images" in
-`CLAUDE.md`), kubelet sees a tag it already has and never re-pulls — a
-`kubectl rollout restart` just restarts pods running your old code, and the
-symptom looks like your code change "didn't take" even though the rollout
-reports success.
-
-The fix is to remove the tag from the node before reloading, not just
-rebuild it:
-
-```bash
-minikube image rm orders-service:local
-minikube image load orders-service:local
-kubectl -n service-health-dashboard rollout restart deployment/orders-service
-```
-
-If `minikube image rm` fails with `conflict: unable to remove repository
-reference "...:local" (must force) - container ... is using its referenced
-image ...`, a running pod is still holding that image — `image rm` silently
-does nothing useful in that case, and the subsequent `image load` keeps
-serving the stale content even though it reports success. Scale the
-Deployment to 0 first so nothing on the node references the old image, then
-rm/load/scale back up:
-
-```bash
-kubectl -n service-health-dashboard scale deployment/orders-service --replicas=0
-minikube image rm orders-service:local
-minikube image load orders-service:local
-kubectl -n service-health-dashboard scale deployment/orders-service --replicas=1
-```
-
-If you're not sure whether the node is actually holding a stale image,
-`minikube image ls` lists what the node currently has — compare its age/ID
-there against your local `docker images` before spending time debugging the
-application itself.
-
-## The dashboard
-
-Status is coded in shape and color together — a solid pill with a checkmark for Healthy, solid amber with a warning triangle for Unhealthy, and a **dashed, hollow** pill with a slash for Unreachable, so "didn't respond at all" never looks like a shade of "responded but sick." Version, response time, and last-successful-check are all live and update every 5 seconds.
-
-**Healthy** — all three monitored services up:
-
-![Dashboard showing orders-service, inventory-service, and notifications-service all healthy](docs/screenshots/dashboard-healthy.jpg)
-
-**`inventory-service` scaled to 0 replicas** — the dashboard marks it `Unreachable` (not "red like Unhealthy"), keeps its last-known version and shows *when* it was last seen, while `orders-service` and the dashboard itself stay unaffected:
-
-![Dashboard showing inventory-service unreachable](docs/screenshots/dashboard-unreachable.jpg)
+See [docs/RUNNING.md](docs/RUNNING.md) for the full walkthrough — building/loading images, Postgres, Jaeger, RabbitMQ, Prometheus + Grafana, opening each UI, and troubleshooting a stale `minikube image load`.
 
 ## Distributed tracing
 
@@ -257,7 +133,7 @@ One dashboard, four panels chosen for what they say about *this* system specific
 
 ## Events (RabbitMQ, transactional outbox, idempotent consumer)
 
-`orders-service` never calls RabbitMQ from the request path. When an order is created/confirmed/cancelled, the corresponding event is written to an `OutboxMessages` row **in the same Postgres transaction** as the order change itself — one commit, both rows, or neither. A separate `OutboxDispatcher` background service polls that table (every 2s) and publishes unpublished rows to a durable topic exchange (`orders`, routing keys `order.created`/`confirmed`/`cancelled`); a row that fails to publish just stays unpublished and gets retried on the next poll — RabbitMQ being down never loses it, because it was already durably committed before any network call was attempted. Retries are bounded, not infinite: after `Outbox:MaxAttempts` (default 20, ~40s of retrying) a row is marked `FailedAtUtc` and excluded from further attempts, logged at `Error`, so a row that can genuinely never publish stops consuming a batch slot forever — without that cutoff, enough such rows would eventually crowd out newer, healthy ones (`OrderBy(CreatedAtUtc)` always tries the oldest pending rows first). The row's payload and last error stay in Postgres either way; resetting `FailedAtUtc` to `NULL` re-queues it.
+`orders-service` never calls RabbitMQ from the request path. When an order is created/confirmed/cancelled, the corresponding event is written to an `OutboxMessages` row **in the same Postgres transaction** as the order change itself — one commit, both rows, or neither. A separate `OutboxDispatcher` background service polls that table (every 2s) and publishes unpublished rows to a durable topic exchange (`orders`, routing keys `order.created`/`confirmed`/`cancelled`); a row that fails to publish just stays unpublished and gets retried on the next poll — RabbitMQ being down never loses it, because it was already durably committed before any network call was attempted. Retries are bounded, not infinite: after `Outbox:MaxAttempts` (default 20, ~40s of retrying) a row is marked `FailedAtUtc` and excluded from further attempts, logged at `Error`, so a row that can genuinely never publish stops consuming a batch slot forever — without that cutoff, enough such rows would eventually crowd out newer, healthy ones (`OrderBy(CreatedAtUtc)` always tries the oldest pending rows first). The row's payload and last error stay in Postgres either way; resetting `FailedAtUtc` to `NULL` re-queues it. See "Transactional outbox instead of publishing directly to RabbitMQ" under Architecture decisions above for why this replaced a simpler direct-publish design.
 
 `notifications-service` binds its own queue to `order.*` and consumes independently — RabbitMQ *is* a hard dependency for it (unlike orders-service), so its own `/health/ready` reflects the connection directly. Because RabbitMQ only guarantees *at-least-once* delivery (and the dispatcher's own retries can legitimately republish a row that was actually delivered, just not yet marked as such), a redelivered event is expected, not a bug: each event carries a stable `EventId` — the outbox row's own `Id`, reused unchanged across every delivery attempt — and the consumer tracks which ids it has already acted on, acking a duplicate without sending a second confirmation. A message that fails to deserialize or map to a known event type is dead-lettered (`orders-notifications.dlq`) instead of looping forever or being silently dropped.
 
@@ -265,9 +141,7 @@ One dashboard, four panels chosen for what they say about *this* system specific
 curl http://localhost:8083/metrics | grep notifications_
 ```
 
-**Why an outbox instead of a direct best-effort publish:** the first version of this (see git history) published directly to RabbitMQ right after the order's commit, catching and logging any failure so it could never fail the order itself — simpler, but with one real gap: a crash in the narrow window between the DB commit and the publish call lost that one event permanently, with nothing left anywhere to retry from. The outbox closes that gap by making the write itself the durable record — nothing is "in flight and unrecorded" at any point. The cost is a table, a migration, and a poll loop; worth it once the guarantee is "no event is ever lost," not "usually isn't."
-
-**Why in-memory idempotency, not a database, in notifications-service:** the service deliberately has no database (see "Architecture decisions" below). The dedupe set of recently-seen `EventId`s lives in one process's memory, which makes it **both per-process and per-instance**:
+**Why in-memory idempotency, not a database, in notifications-service:** the service deliberately has no database (see "Architecture decisions" above). The dedupe set of recently-seen `EventId`s lives in one process's memory, which makes it **both per-process and per-instance**:
 
 - **Per-process:** it does not survive a restart. A message redelivered *after* a restart (RabbitMQ requeues something unacked, the pod restarts, only then does the redelivery land) would be processed again — the dedupe window resets to empty along with everything else in memory.
 - **Per-instance:** it is not shared across replicas. Today `notifications-service` runs as a single pod, so this doesn't come up — but RabbitMQ hands each message on a queue to *one* of its connected consumers (competing consumers), not to all of them, and it picks arbitrarily. Scale this deployment to 2+ replicas and a message delivered to pod A and a redelivery of the *same* message routed to pod B would not be deduped against each other — each pod only knows what it has personally seen.
@@ -276,7 +150,7 @@ Both gaps are the same trade-off from two angles: this is safe **only** because 
 
 ## CI/CD
 
-GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR to `master`: restore, build, test the whole solution, then build all four service images (catches a broken Dockerfile early). On a push to `master` specifically — not on PRs — a separate job also **publishes** those four images to GitHub Container Registry, tagged with both the short git SHA and `latest`, built with the same `GIT_SHA`/`BUILD_TIME` build args as the local `docker build` commands above so a published image's `/version` endpoint shows a real commit and build time, not `"unknown"`.
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR to `master`: restore, build, test the whole solution, then build all four service images (catches a broken Dockerfile early). On a push to `master` specifically — not on PRs — a separate job also **publishes** those four images to GitHub Container Registry, tagged with both the short git SHA and `latest`, built with the same `GIT_SHA`/`BUILD_TIME` build args as the local `docker build` commands in [docs/RUNNING.md](docs/RUNNING.md) so a published image's `/version` endpoint shows a real commit and build time, not `"unknown"`.
 
 If any job fails on a push to `master`, a final job opens a GitHub issue (labeled `ci-failure`, linking straight to the run) instead of relying on the CI badge above being the only signal — there's no public API for the personal "notify me on failed Actions" account setting, so an open issue on the repo itself is the automatable equivalent.
 
@@ -296,27 +170,9 @@ GHCR packages are public for this repo — no `docker login` needed to pull.
 
 ### What this CI/CD pipeline does *not* do
 
-**There is no auto-deploy, and there cannot be one against this project's own Kubernetes target as it's set up today.** Everything in "Kubernetes (minikube)" above runs against a `minikube` cluster living on this machine's own Docker Desktop/Hyper-V — a GitHub-hosted runner has no network path to it, no `kubeconfig` for it, and nothing worth granting one even if it did (minikube isn't reachable from the internet, on purpose — it's a local dev cluster, not a deployment target). The pipeline's job ends at "an image exists in GHCR that `kubectl`/`minikube image load` could use next" — pulling it into minikube and rolling the Deployments is still the same manual `kubectl apply`/`minikube image load` sequence documented above. Claiming otherwise — a green checkmark that implies "and now it's live" — would be misleading about what actually happened. A real CD story would need a cluster GitHub Actions can actually reach (a cloud-hosted cluster, or a self-hosted runner with network access to this machine) plus something to drive the rollout (`kubectl set image`, ArgoCD/Flux watching the registry, etc.) — a different kind of infrastructure than "run it on my laptop," not a missing workflow step.
-
-## Architecture decisions
-
-**Fail-closed, not optimistic.** `orders-service` rejects an order it can't confirm stock for, rather than accepting it and reconciling later. The alternative — accept now, settle later — was rejected because overselling is more expensive to unwind than a customer seeing a retryable `503`. Backed by a Polly v8 resilience pipeline (timeout, retry with backoff + jitter, circuit breaker) that only retries transient failures, never a `409` (insufficient stock) or `404`.
-
-**Idempotency via order ID.** Every stock reservation is keyed by the order's ID, so a retried request — including the resilience pipeline's own retries — can't double-reserve. The alternative, trusting the caller to never retry, doesn't hold once you've added retries yourself.
-
-**TTL instead of compensating release.** A reservation expires on its own via a background sweep in `inventory-service`, instead of `orders-service` issuing a compensating "release" call when something fails downstream. A saga/compensating-transaction approach was rejected because the compensating call would go through the very service that may be the reason things are failing — TTL doesn't depend on anything else being reachable.
-
-**Transactional outbox instead of publishing directly to RabbitMQ.** An order-lifecycle event is written to an `OutboxMessages` row in the same Postgres transaction as the order change itself, and a separate background dispatcher publishes it afterwards — `orders-service` never calls RabbitMQ from the request path at all. The alternative — publish directly to RabbitMQ right after the commit, catching and logging any failure so it could never fail the order — is simpler and was this project's first version (see git history), but has one real gap: a crash in the narrow window between the DB commit and the publish call loses that one event permanently, with nothing left anywhere to retry from. The outbox closes that gap by making the write itself the durable record, at the cost of a table, a migration, and a poll loop. See "Events" below for the full mechanics, including the bounded-retry/dead-letter handling on both ends.
-
-**`/health/live` vs. `/health/ready`.** Live has no dependencies and is always healthy if the process is running; ready checks the database. Kubernetes uses live for restart decisions and ready for traffic routing. A single combined endpoint was rejected because it would turn a brief database hiccup into an unnecessary pod restart instead of just a short pause in traffic.
-
-**notifications-service has no database, on purpose.** Its only job is reacting to events it doesn't own — adding a database just to store a dedupe set (see "Events" above) would mean a fourth Postgres instance, a fourth migration story, and a fourth thing that can be down, for a service whose entire value is being simple and disposable. The in-memory idempotency store is the direct consequence of that choice, not an oversight.
-
-**The dashboard can't inherit anyone else's outage.** `dashboard-service`'s own `/health/ready` has zero registered checks, so it's structurally incapable of reporting unhealthy because a service it watches is down — confirmed above by scaling `inventory-service` to 0 while the dashboard stayed `Ready`. Tying its health to the services it monitors was rejected because that's exactly the tool you need most during an actual incident.
+**There is no auto-deploy, and there cannot be one against this project's own Kubernetes target as it's set up today.** Everything in [docs/RUNNING.md](docs/RUNNING.md) runs against a `minikube` cluster living on this machine's own Docker Desktop/Hyper-V — a GitHub-hosted runner has no network path to it, no `kubeconfig` for it, and nothing worth granting one even if it did (minikube isn't reachable from the internet, on purpose — it's a local dev cluster, not a deployment target). The pipeline's job ends at "an image exists in GHCR that `kubectl`/`minikube image load` could use next" — pulling it into minikube and rolling the Deployments is still the same manual `kubectl apply`/`minikube image load` sequence documented there. Claiming otherwise — a green checkmark that implies "and now it's live" — would be misleading about what actually happened. A real CD story would need a cluster GitHub Actions can actually reach (a cloud-hosted cluster, or a self-hosted runner with network access to this machine) plus something to drive the rollout (`kubectl set image`, ArgoCD/Flux watching the registry, etc.) — a different kind of infrastructure than "run it on my laptop," not a missing workflow step.
 
 ## Not done yet
-
-Step 6 (distributed tracing, structured logging, metrics, Prometheus + Grafana), step 7 (a third service and a real message bus), and step 8's CI-and-image-publish half are done — see "Distributed tracing", "Metrics", "Metrics dashboards", "Events (RabbitMQ)", and "CI/CD" above.
 
 - **No auto-deploy.** Deliberately out of scope for this repo, not an oversight — see "What this CI/CD pipeline does *not* do" under "CI/CD" above for why a GitHub-hosted runner can't reach a local minikube cluster and what a real deploy target would actually require.
 - **No alerting on abandoned outbox rows.** `OutboxDispatcher` gives up on a row after `Outbox:MaxAttempts` (default 20, ~40s) and marks it `FailedAtUtc` instead of retrying forever — see "Events" above — but nothing currently watches for that happening. The row and its `LastError` stay in Postgres for manual inspection either way; a Grafana panel or alert on `orders_events_publish_abandoned_total` is the natural next step.

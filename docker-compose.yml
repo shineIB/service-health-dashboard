@@ -8,6 +8,17 @@ services:
       - "4317:4317"   # OTLP gRPC
       - "4318:4318"   # OTLP HTTP
 
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Management UI
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -37,12 +48,17 @@ services:
       Infrastructure__ConnectionString: "Host=postgres;Port=5432;Database=orders;Username=orders;Password=orders"
       Database__RunMigrationsOnStartup: "true"
       InventoryClient__BaseUrl: "http://inventory-service:8080"
+      RabbitMq__HostName: "rabbitmq"
+      RabbitMq__UserName: "guest"
+      RabbitMq__Password: "guest"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
     depends_on:
       postgres:
         condition: service_healthy
       inventory-service:
         condition: service_started
+      rabbitmq:
+        condition: service_healthy
       jaeger:
         condition: service_started
 
@@ -77,6 +93,26 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
     depends_on:
       inventory-postgres:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+
+  notifications-service:
+    build:
+      context: .
+      dockerfile: src/NotificationsService/NotificationsService.Api/Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-local}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    ports:
+      - "8083:8080"
+    environment:
+      RabbitMq__HostName: "rabbitmq"
+      RabbitMq__UserName: "guest"
+      RabbitMq__Password: "guest"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
+    depends_on:
+      rabbitmq:
         condition: service_healthy
       jaeger:
         condition: service_started

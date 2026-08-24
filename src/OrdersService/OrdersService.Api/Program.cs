@@ -9,6 +9,7 @@ using OrdersService.Api.Configuration;
 using OrdersService.Api.Endpoints;
 using OrdersService.Api.Telemetry;
 using OrdersService.Infrastructure;
+using OrdersService.Infrastructure.Telemetry;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -44,6 +45,8 @@ builder.Services.AddOpenTelemetry()
         // Polly v8's resilience telemetry (ActivitySource "Polly") — this is what turns
         // each retry attempt and the circuit breaker opening into their own spans.
         .AddSource("Polly")
+        // order.publish-event spans around each RabbitMQ publish — see RabbitMqEventPublisher.
+        .AddSource(MessagingTelemetry.ActivitySourceName)
         // Defaults to http://localhost:4317; overridden via OTEL_EXPORTER_OTLP_ENDPOINT
         // (see k8s/jaeger and docker-compose.yml) — the OTel SDK reads that env var itself.
         .AddOtlpExporter())
@@ -52,6 +55,8 @@ builder.Services.AddOpenTelemetry()
         .AddHttpClientInstrumentation()
         // orders.created / orders.rejected / orders.cancelled — see OrdersTelemetry.
         .AddMeter(OrdersTelemetry.MeterName)
+        // orders.events.published / orders.events.publish_failed — see MessagingTelemetry.
+        .AddMeter(MessagingTelemetry.MeterName)
         // Pull-based, not OTLP push: Jaeger only understands traces, and there's no
         // Prometheus/Grafana deployed yet to receive a push either (see CLAUDE.md, step 6
         // part 2). Scraped at GET /metrics until that infra exists.

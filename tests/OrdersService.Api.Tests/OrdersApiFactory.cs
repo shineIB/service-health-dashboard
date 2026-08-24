@@ -18,6 +18,7 @@ public class OrdersApiFactory : WebApplicationFactory<Program>
     private readonly string _connectionString;
 
     public FakeInventoryClient InventoryClient { get; } = new();
+    public FakeEventPublisher EventPublisher { get; } = new();
 
     public OrdersApiFactory(PostgresContainerFixture postgres)
     {
@@ -39,6 +40,9 @@ public class OrdersApiFactory : WebApplicationFactory<Program>
         {
             services.RemoveAll<IInventoryClient>();
             services.AddSingleton<IInventoryClient>(InventoryClient);
+
+            services.RemoveAll<IEventPublisher>();
+            services.AddSingleton<IEventPublisher>(EventPublisher);
         });
     }
 }

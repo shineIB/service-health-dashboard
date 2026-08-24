@@ -1,17 +1,21 @@
+# No Secret, no PVC, no migration Job: notifications-service has no database of its own — it
+# only consumes order events from RabbitMQ. RabbitMq__Password is "guest" (RabbitMQ's own
+# dev-only default), no more sensitive here than orders-service's copy of the same value —
+# same "plain env var, not a Secret" call as dashboard-service's MonitoredServices__* URLs.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: orders-service
+  name: notifications-service
   namespace: service-health-dashboard
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: orders-service
+      app: notifications-service
   template:
     metadata:
       labels:
-        app: orders-service
+        app: notifications-service
       annotations:
         # Picked up by Prometheus's kubernetes_sd_configs (k8s/prometheus/configmap.yaml) on
         # the next pod restart — no separate target list to keep in sync with this Deployment.
@@ -20,18 +24,12 @@ spec:
         prometheus.io/path: "/metrics"
     spec:
       containers:
-        - name: orders-service
-          image: orders-service:local
+        - name: notifications-service
+          image: notifications-service:local
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
           env:
-            # false here, not the docker-compose default of true: see the
-            # migration-Job decision above and in CLAUDE.md.
-            - name: Database__RunMigrationsOnStartup
-              value: "false"
-            - name: InventoryClient__BaseUrl
-              value: "http://inventory-service:8080"
             - name: RabbitMq__HostName
               value: "rabbitmq"
             - name: RabbitMq__UserName
@@ -42,25 +40,17 @@ spec:
             # spec-defined OTel env var. See k8s/jaeger and CLAUDE.md.
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://jaeger:4317"
-          envFrom:
-            - secretRef:
-                name: orders-service-secret
+          # Same shape as orders-service/inventory-service/dashboard-service's probes (see
+          # orders-service/deployment.yaml for the reasoning behind the numbers). Unlike
+          # dashboard-service, /health/ready here IS meaningful on its own — RabbitMqHealthCheck
+          # reflects OrderEventConsumer's actual connection state (see CLAUDE.md, step 7).
           startupProbe:
-            # Budget: ~30s (15 x 2s) for a cold minimal-API start — DI container
-            # + EF Core model build — on a resource-constrained minikube node.
-            # Generous compared to the ~1-2s this takes on a dev machine, but a
-            # genuinely stuck pod still gets caught well before it would eat
-            # into livenessProbe's restart budget below.
             httpGet:
               path: /health/live
               port: 8080
             periodSeconds: 2
             failureThreshold: 15
           livenessProbe:
-            # Runs only once startupProbe has passed, so no separate initialDelay
-            # is needed here. 3 x 10s before a restart: liveness failures cause a
-            # full pod restart, so this should absorb one slow tick (e.g. a GC
-            # pause) rather than react to the first miss.
             httpGet:
               path: /health/live
               port: 8080
@@ -68,9 +58,6 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 3
           readinessProbe:
-            # Shorter period than liveness: readiness only pulls the pod out of
-            # the Service's endpoints (cheap, reversible), so it can react faster
-            # when the pod's own Postgres becomes unreachable — about 15s here.
             httpGet:
               path: /health/ready
               port: 8080

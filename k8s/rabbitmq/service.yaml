@@ -1,0 +1,21 @@
+# NodePort so the management UI is reachable the same way as Jaeger/Grafana (`minikube
+# service rabbitmq -n service-health-dashboard`). The AMQP port gets NodePort'd too as a side
+# effect of sharing one Service — harmless, since orders-service/notifications-service reach
+# it in-cluster via the ClusterIP every Service gets regardless of type, at
+# http://rabbitmq:5672.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: service-health-dashboard
+spec:
+  type: NodePort
+  selector:
+    app: rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: 5672
+    - name: management-ui
+      port: 15672
+      targetPort: 15672

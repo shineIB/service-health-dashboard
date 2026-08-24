@@ -945,4 +945,196 @@ datasource) redan är i git.
    i en och samma bild (`docs/screenshots/grafana-dashboard-incident-and-recovery.jpg`),
    använd i README.
 
-Nästa steg: steg 7 (tredje tjänsten + meddelandebuss).
+## Steg 7 — notifications-service + RabbitMQ. Klart och verifierat.
+
+**Beslut, valda via fråga innan jag började (inte gissade):**
+
+- **RabbitMQ**, inte NATS — mer etablerat i .NET-ekosystemet, lättare att visa
+  upp i ett portfolio-repo (management-UI). Den öppna frågan i prioritets-
+  ordningen ("börja med in-memory/HTTP, byt till RabbitMQ/NATS när tjänst 1
+  och 2 står") är därmed löst.
+- **Direkt publish efter DB-commit, inte transactional outbox.** Enklare:
+  publicera till RabbitMQ direkt efter att ordern sparats, med publisher
+  confirms. Ett litet fönster där processen kan krascha mellan commit och
+  publish (eventet går då förlorat) — medveten avvägning, samma stil som
+  TTL-beslutet i steg 3: en förlorad notifiering är irriterande, inte en
+  korrekthetsbugg på samma sätt som en förlorad order eller dubbel
+  reservation hade varit. Outbox noteras som naturligt nästa steg.
+
+**Övriga beslut (mina, inom given ram):**
+
+- **Best-effort publish, blockerar aldrig ordern.** `IEventPublisher`
+  (`OrdersService.Domain`) implementeras av `RabbitMqEventPublisher`
+  (`OrdersService.Infrastructure`) som fångar alla RabbitMQ-fel internt
+  (loggar varning + räknar `orders.events.publish_failed`), kastar aldrig
+  vidare — exakt samma mönster som `CancelOrder`s best-effort
+  `ReleaseStockAsync`-anrop (se steg 3 del 2). orders-service `/health/ready`
+  förblir Postgres-bara; RabbitMQ nere hindrar aldrig en order från att gå
+  igenom.
+- **Lazy connect + automatic recovery på orders-sidan.** `RabbitMqConnectionProvider`
+  skapar sin `IConnection` först vid första publiceringen (inte vid
+  startup), med `AutomaticRecoveryEnabled`/`TopologyRecoveryEnabled` —
+  orders-service ska aldrig kräva att RabbitMQ är uppe för att starta.
+  notifications-sidans motsvarande provider är identisk i sig själv, men
+  `OrderEventConsumer` (en riktig `BackgroundService`) lägger en egen
+  connect-retry-loop ovanpå den, eftersom RabbitMQ där ÄR ett hårt beroende
+  — automatic recovery läker bara en redan upprättad anslutning, inte det
+  allra första anslutningsförsöket om RabbitMQ inte är uppe när podden
+  startar.
+- **Egna, dupliceringsbara event-DTO:er per tjänst, ingen delad
+  Contracts-assembly.** Samma princip som `InventoryClient.cs`s "local
+  shape" för inventory-service:s svar: orders-service definierar sin
+  publicerade JSON-form (`OrderEventPayload`), notifications-service sin
+  egen deserialiserade form (`OrderEventEnvelope`) — håller tjänsterna
+  oberoende deploybara.
+- **Topic-exchange `orders` (durable), routing keys `order.created`/
+  `order.confirmed`/`order.cancelled`.** Payloaden bär också ett
+  `EventType`-fält — meddelandet är självbärande, konsumenten behöver inte
+  läsa routing key.
+- **Dead-letter queue** (`orders.dlx` fanout → `orders-notifications.dlq`)
+  på notifications-service:s queue. Ett meddelande som inte går att
+  deserialisera eller hanteras nackas utan requeue och hamnar i DLQ:n
+  istället för att loopa oändligt eller försvinna tyst. Ingen automatisk
+  DLQ-reprocessing — manuell inspektion, samma "medveten förenkling"-linje
+  som Jaeger/Prometheus utan persistent lagring.
+- **notifications-service Domain-lager, tunt men inte tomt:**
+  `OrderEventType` (enum), `OrderNotification` (record), `INotificationSender`
+  (interface, implementeras av `LoggingNotificationSender` — simulerar
+  "skicka bekräftelse" via strukturerad logg). Ger en testbar söm utan att
+  bygga en riktig avisering nu.
+- **`OrderEventHandler` utbruten från `OrderEventConsumer`**, samma
+  motivering som `ServiceHealthChecker` i dashboard-service: deserialisering
+  + dispatch är direkt testbar utan en riktig RabbitMQ-anslutning.
+  `OrderEventConsumer` äger bara själva RabbitMQ-rörledningen (anslut,
+  deklarera topologi, konsumera, ack/nack).
+- **RabbitMQ i klustret utan PVC**, samma avvägning som Jaeger/Prometheus/
+  Grafana. Management-UI exponerad som NodePort av samma anledning som
+  Jaeger/Grafana.
+- **Test-uppdelning matchar `DashboardService`:** ingen
+  `NotificationsService.Domain.Tests` (domänlagret är tunt, inga regler att
+  låsa fast i isolering), bara `NotificationsService.Infrastructure.Tests`
+  och `NotificationsService.Api.Tests`.
+- **Riktig RabbitMQ i `NotificationsService.Api.Tests`, inte en fejk** —
+  `RabbitMqContainerFixture` (Testcontainers.RabbitMq), delad per collection,
+  samma princip som `PostgresContainerFixture` i orders/inventory. `/health/ready`
+  testas mot en verklig anslutning (pollas — se nästa punkt), och ett test
+  publicerar ett riktigt meddelande på containerns exchange och pollar
+  `/metrics` efter `notifications_sent_total` — ett genuint end-to-end-test
+  av hela konsument-kedjan, inte bara den isolerade handler-logiken.
+  `NotificationsService.Infrastructure.Tests` behöver däremot ingen RabbitMQ
+  alls: `OrderEventHandler`s tester kör mot handbyggda JSON-payloads direkt.
+
+**Upptäckt under testskrivning — samma `builder.Configuration`-fälla som
+redan dokumenterad två gånger tidigare (steg 8, `Database:RunMigrationsOnStartup`-
+kommentaren i `Program.cs`; CI-uppföljningen med Testcontainers-anslutningssträngen),
+nu en tredje gång.** `RabbitMqOptions` lästes i både orders- och
+notifications-service:s `Add*Infrastructure`-metoder via
+`configuration.GetSection(...).Get<RabbitMqOptions>()` där `configuration`
+var parametern som skickas in **före** `builder.Build()` — exakt samma
+mönster som redan var känt fel för databas-anslutningssträngar.
+`WebApplicationFactory`s `ConfigureAppConfiguration`-overrides (i det här
+fallet: en riktig Testcontainers RabbitMQ-host/port istället för
+`appsettings.json`s `localhost:5672`) landar bara i den färdigbyggda
+konfigurationen, aldrig i den tidiga snapshotten. Effekten var tyst och
+förvirrande: `NotificationsApiFactory`s test av "RabbitMQ onåbar → 503"
+gick grönt av fel anledning (anslöt av misstag till en **kvarglömd
+`docker compose`-RabbitMQ-container på `localhost:5672` från en tidigare
+manuell verifieringsrunda i samma session**, inte till den riktiga
+Testcontainers-instansen), och konsumtions-testet (publicera på den
+riktiga containern, förvänta `notifications_sent_total`) failade eftersom
+appen faktiskt lyssnade på en helt annan broker än den testet publicerade
+till.
+**Fix, samma mönster som redan etablerat för `AddDbContext`:** båda
+`RabbitMqOptions`-registreringarna läser nu lazy via en DI-factory
+(`services.AddSingleton(sp => sp.GetRequiredService<IConfiguration>()...)`),
+upplöst först vid första faktiska resolve (efter `Build()`), inte fångad
+vid registreringstillfället. **Lärdom att skriva ner tydligare den här
+gången:** det här är inte en engångsmiss, det är ett generellt mönster —
+*varje* `Add*Infrastructure`-metod som binder en typad options-klass direkt
+från den `IConfiguration`-parameter som skickas in före `builder.Build()`
+har samma latenta bugg, även om den bara syns när något (ett test, en
+override) faktiskt behöver läsa ett värde som sattes efter den punkten.
+Värt att svepa igenom `InventoryClientOptions` (samma mönster, ännu inte
+exercisead av ett failande test) vid ett senare tillfälle.
+
+**Testtäckning:** `OrderEventHandlerTests` (giltig payload per event-typ →
+rätt mappad `OrderNotification` + ack; trasig JSON → nack; okänd event-typ →
+nack; sändaren kastar → nack, propagerar inte). `OrderEndpointsTests`
+utökad med en `FakeEventPublisher` (samma mönster som `FakeInventoryClient`):
+publish anropas vid create/confirm/cancel, och en avvisad order (409) leder
+inte till någon publicering. `NotificationsService.Api.Tests`: liveness,
+readiness (både verkligt uppkopplad och verkligt onåbar), version, metrics
+(inklusive det riktiga konsumtions-end-to-end-testet ovan). Alla 88 tester i
+lösningen (orders + inventory + dashboard + notifications) gröna.
+
+**Verifierat på riktigt mot docker-compose:**
+
+1. Ny `rabbitmq`-service i `docker-compose.yml` (`rabbitmq:4-management-alpine`,
+   healthcheck via `rabbitmq-diagnostics -q ping`), orders-service fick
+   `RabbitMq__*`-env + `depends_on: rabbitmq (service_healthy)`.
+2. `docker compose up --build`: skapade en order → bekräftade via RabbitMQ
+   management-API att `orders`-exchangen (topic, durable) hade `publish_in: 1`
+   innan notifications-service ens fanns i stacken (fas A, ingen konsument
+   än).
+3. Lade till `notifications-service` i `docker-compose.yml`, byggde om.
+   Skapade, bekräftade och avbokade ordrar genom hela kedjan — loggarna i
+   notifications-service visade alla tre event-typer konsumerade med rätt
+   order-/kund-ID, och `/metrics` visade `notifications_sent_total` med
+   rätt `event_type`-taggar (2×`order.created`, 1×`order.confirmed`,
+   1×`order.cancelled` efter fyra testordrar).
+4. `docker compose stop rabbitmq`: `notifications-service`s `/health/ready`
+   gick till 503 (dess hårda beroende), medan `POST /orders` fortsatte svara
+   201 med en loggad `BrokerUnreachableException`-varning (bekräftat i
+   loggarna, inte gissat) — orders-service:s egen `/health/ready` opåverkad
+   hela tiden. `docker compose start rabbitmq`: båda sidor självläkte utan
+   någon omstart — notifications-service:s connect-retry-loop återanslöt
+   och började konsumera igen, orders-service:s lazy-connect återanslöt vid
+   nästa publiceringsförsök, `notifications_sent_total` fortsatte räkna
+   uppåt.
+5. Publicerade ett medvetet trasigt meddelande direkt via management-API:t
+   (`payload: "not valid json at all"`) — `notifications_failed_total{reason="deserialize_error"}`
+   ökade, huvudkön (`notifications.order-events`) förblev på 0 meddelanden
+   (inte fastnat), och `orders-notifications.dlq` visade `messages: 1`.
+
+**Verifierat på riktigt i minikube** (samma kluster som tidigare steg, ingen
+omstart av hela klustret behövdes):
+
+1. Byggde om `orders-service`-imagen (ny RabbitMq-publiceringskod) och en ny
+   `notifications-service`-image med samma `GIT_SHA`/`BUILD_TIME`-build-args
+   som tidigare steg. Skalade ner `orders-service` till 0 innan
+   `minikube image rm`/`image load` — samma redan dokumenterade
+   stale-tag-fälla, `image rm` failade första gången med "container ... is
+   using its referenced image" tills podden faktiskt hunnit termineras.
+2. `kubectl apply` av `k8s/rabbitmq/` (Deployment utan PVC + NodePort-Service,
+   samma avvägning som Jaeger) och `k8s/notifications-service/` (Deployment
+   + ClusterIP-Service, inga Secret/Job — ingen databas, inget känsligt
+   lösenord). `orders-service/deployment.yaml` fick `RabbitMq__*`-env pekande
+   på `rabbitmq`-Servicen. Alla tre rullade ut rent, `1/1 Ready` direkt.
+3. Skapade en riktig order genom `orders-service`s NodePort (via
+   `kubectl port-forward`, inte `minikube service` — enklare för skriptad
+   verifiering över flera anrop). `kubectl logs deployment/notifications-service`
+   visade eventet konsumerat med rätt order-/kund-ID inom en sekund.
+4. `kubectl scale deployment/rabbitmq --replicas=0`: `notifications-service`s
+   `/health/ready` gick till 503, `orders-service`s egen `/health/ready`
+   förblev `Healthy`, och `POST /orders` fortsatte svara 201. `kubectl scale
+   deployment/rabbitmq --replicas=1`: ny order konsumerades igen inom
+   sekunder, **`Restart Count: 0`** på både `orders-service`- och
+   `notifications-service`-podden hela tiden — självläkning utan en enda
+   pod-omstart, exakt som designat.
+5. Prometheus `/api/v1/targets` bekräftade `notifications-service` som `up`
+   direkt efter första rollouten — annotation-baserad discovery plockade upp
+   den fjärde tjänsten utan någon ändring i `k8s/prometheus/configmap.yaml`,
+   exakt löftet från steg 6 del 3.
+
+**Medvetet inte gjort i det här passet** (noterat i README under "Not done
+yet"): transactional outbox (se beslutet ovan), Grafana-paneler för
+`notifications_sent_total`/`notifications_failed_total` (Prometheus
+scrapear redan tjänsten, bara inte visualiserat), och att svepa igenom
+`InventoryClientOptions` för samma latenta `builder.Configuration`-mönster
+som fixades för `RabbitMqOptions` ovan.
+
+Nästa steg: steg 8 kvarstår redan löst (CI klart sedan tidigare) — nästa
+naturliga arbete är antingen CD (auto-deploy) eller någon av de mindre
+uppföljningarna som redan är noterade (transactional outbox,
+notifications-paneler i Grafana, k8s-native service discovery för
+dashboard, SSE/WebSocket istället för polling).

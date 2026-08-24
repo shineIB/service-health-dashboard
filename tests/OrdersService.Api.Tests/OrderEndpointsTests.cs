@@ -49,6 +49,32 @@ public class OrderEndpointsTests : IClassFixture<OrdersApiFactory>
 
         var body = await response.Content.ReadFromJsonAsync<OrderResponse>();
         _factory.InventoryClient.ReserveCalls.Should().ContainSingle(call => call.OrderId == body!.Id);
+        _factory.EventPublisher.CreatedOrderIds.Should().Contain(body!.Id);
+    }
+
+    [Fact]
+    public async Task CreateOrder_WhenInventoryReportsInsufficientStock_DoesNotPublishAnEvent()
+    {
+        var client = _factory.CreateClient();
+        _factory.InventoryClient.NextReserveResult = ReserveStockResult.InsufficientStock("Insufficient stock for product.");
+        var request = ValidCreateOrderRequest();
+
+        var response = await client.PostAsJsonAsync("/orders", request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.Conflict);
+        _factory.EventPublisher.CreatedOrderIds.Should().BeEmpty("a rejected order was never persisted, so it must not be published either");
+    }
+
+    [Fact]
+    public async Task ConfirmOrder_PublishesAnOrderConfirmedEvent()
+    {
+        var client = _factory.CreateClient();
+        var order = await CreateOrderAsync(client);
+
+        var response = await client.PostAsync($"/orders/{order.Id}/confirm", content: null);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        _factory.EventPublisher.ConfirmedOrderIds.Should().Contain(order.Id);
     }
 
     [Fact]
@@ -90,6 +116,7 @@ public class OrderEndpointsTests : IClassFixture<OrdersApiFactory>
         response.StatusCode.Should().Be(HttpStatusCode.OK);
         _factory.InventoryClient.ReleaseCalls.Should().ContainSingle(call =>
             call.OrderId == order.Id && call.ProductId == order.Items[0].ProductId);
+        _factory.EventPublisher.CancelledOrderIds.Should().Contain(order.Id);
     }
 
     [Fact]

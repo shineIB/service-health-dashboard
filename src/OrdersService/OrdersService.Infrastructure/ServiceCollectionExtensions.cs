@@ -32,8 +32,22 @@ public static class ServiceCollectionExtensions
             .AddCheck<PostgresHealthCheck>(name: "postgres", tags: ["ready"], timeout: TimeSpan.FromSeconds(2));
 
         AddInventoryClient(services, configuration);
+        AddEventPublisher(services);
 
         return services;
+    }
+
+    private static void AddEventPublisher(IServiceCollection services)
+    {
+        // Resolved from the service provider's IConfiguration, not the `configuration` parameter
+        // captured here — same reasoning as AddDbContext<OrdersDbContext> above: WebApplicationFactory
+        // test overrides only land in the fully-built configuration, not this pre-Build snapshot.
+        services.AddSingleton(serviceProvider =>
+            serviceProvider.GetRequiredService<IConfiguration>()
+                .GetSection(RabbitMqOptions.SectionName).Get<RabbitMqOptions>()
+                ?? throw new InvalidOperationException($"Missing configuration section '{RabbitMqOptions.SectionName}'."));
+        services.AddSingleton<RabbitMqConnectionProvider>();
+        services.AddSingleton<IEventPublisher, RabbitMqEventPublisher>();
     }
 
     private static void AddInventoryClient(IServiceCollection services, IConfiguration configuration)

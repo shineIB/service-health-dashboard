@@ -28,6 +28,7 @@ public static class OrderEndpoints
         CreateOrderRequest request,
         IOrderRepository repository,
         IInventoryClient inventoryClient,
+        IEventPublisher eventPublisher,
         HttpContext httpContext,
         CancellationToken cancellationToken)
     {
@@ -72,6 +73,7 @@ public static class OrderEndpoints
         await repository.SaveChangesAsync(cancellationToken);
 
         OrdersTelemetry.OrdersCreated.Add(1);
+        await eventPublisher.PublishOrderCreatedAsync(order, cancellationToken);
 
         var response = OrderResponse.FromDomain(order);
         return TypedResults.Created($"/orders/{order.Id}", response);
@@ -99,6 +101,7 @@ public static class OrderEndpoints
     private static async Task<Results<Ok<OrderResponse>, NotFound>> ConfirmOrder(
         Guid id,
         IOrderRepository repository,
+        IEventPublisher eventPublisher,
         CancellationToken cancellationToken)
     {
         var order = await repository.GetByIdAsync(id, cancellationToken);
@@ -107,6 +110,7 @@ public static class OrderEndpoints
 
         order.Confirm();
         await repository.SaveChangesAsync(cancellationToken);
+        await eventPublisher.PublishOrderConfirmedAsync(order, cancellationToken);
         return TypedResults.Ok(OrderResponse.FromDomain(order));
     }
 
@@ -114,6 +118,7 @@ public static class OrderEndpoints
         Guid id,
         IOrderRepository repository,
         IInventoryClient inventoryClient,
+        IEventPublisher eventPublisher,
         ILogger<LogCategory> logger,
         CancellationToken cancellationToken)
     {
@@ -125,6 +130,7 @@ public static class OrderEndpoints
         await repository.SaveChangesAsync(cancellationToken);
 
         OrdersTelemetry.OrdersCancelled.Add(1);
+        await eventPublisher.PublishOrderCancelledAsync(order, cancellationToken);
 
         // The cancellation itself is already committed above: releasing the reservation
         // is a best-effort side effect, not a precondition. If it fails, the order stays

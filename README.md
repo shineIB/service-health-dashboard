@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/shineIB/service-health-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/shineIB/service-health-dashboard/actions/workflows/ci.yml)
 
-A small e-commerce backend built to demonstrate *running* a microservice system, not just writing one. Two .NET services — orders and inventory — coordinate over HTTP with real failure handling (timeouts, retries, circuit breaking, idempotency), run in Kubernetes, and are watched by a third service that reports their live health, version, and deploy info without ever depending on them staying up.
+A small e-commerce backend built to demonstrate *running* a microservice system, not just writing one. Orders and inventory coordinate over HTTP with real failure handling (timeouts, retries, circuit breaking, idempotency); orders-service publishes order-lifecycle events over RabbitMQ that notifications-service consumes independently; all three run in Kubernetes and are watched by a fourth service that reports their live health, version, and deploy info without ever depending on them staying up.
 
 ## Architecture
 
@@ -14,6 +14,8 @@ graph LR
         Dashboard["dashboard-service<br/>(NodePort)"]
         Orders["orders-service<br/>(NodePort)"]
         Inventory["inventory-service<br/>(ClusterIP)"]
+        Notifications["notifications-service<br/>(ClusterIP)"]
+        RabbitMQ[("rabbitmq")]
         OrdersDB[("orders-postgres")]
         InventoryDB[("inventory-postgres")]
     end
@@ -23,11 +25,13 @@ graph LR
     Dashboard -. "poll /health/ready + /version every 5s" .-> Orders
     Dashboard -. "poll /health/ready + /version every 5s" .-> Inventory
     Orders -- "reserve / release stock (resilient HTTP)" --> Inventory
+    Orders -- "publish order.created/confirmed/cancelled (best-effort)" --> RabbitMQ
+    RabbitMQ -- "consume order.*" --> Notifications
     Orders --> OrdersDB
     Inventory --> InventoryDB
 ```
 
-`orders-service` validates and reserves stock in `inventory-service` synchronously before accepting an order. `dashboard-service` polls both on its own schedule and serves a small React SPA showing what it finds — it never proxies a browser request into either service.
+`orders-service` validates and reserves stock in `inventory-service` synchronously before accepting an order, then publishes an event over RabbitMQ — best-effort, never blocking the order itself. `notifications-service` consumes those events independently and logs a simulated confirmation. `dashboard-service` polls orders/inventory on its own schedule and serves a small React SPA showing what it finds — it never proxies a browser request into either service.
 
 ## Run it yourself
 
@@ -42,24 +46,28 @@ docker compose up --build
 - Orders: http://localhost:8080
 - Inventory: http://localhost:8081
 - Dashboard: http://localhost:8082
+- Notifications: http://localhost:8083 (no public API — `/health/*`, `/version`, `/metrics` only)
+- RabbitMQ management UI: http://localhost:15672 (guest/guest)
 
 ### Kubernetes (minikube)
 
 Everything lives in the `service-health-dashboard` namespace — pass `-n service-health-dashboard` (or `kubectl -n service-health-dashboard ...`) for every command below.
 
 ```bash
-# Build and load the three images (no external registry)
+# Build and load the four images (no external registry)
 # GIT_SHA/BUILD_TIME are baked in as build args so the dashboard's "version"
 # column shows something other than "unknown" — see Dockerfile comments.
 GIT_SHA=$(git rev-parse --short HEAD)
 BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-docker build -t orders-service:local    -f src/OrdersService/OrdersService.Api/Dockerfile    --build-arg GIT_SHA=$GIT_SHA --build-arg BUILD_TIME=$BUILD_TIME .
-docker build -t inventory-service:local -f src/InventoryService/InventoryService.Api/Dockerfile --build-arg GIT_SHA=$GIT_SHA --build-arg BUILD_TIME=$BUILD_TIME .
-docker build -t dashboard-service:local -f src/DashboardService/DashboardService.Api/Dockerfile --build-arg GIT_SHA=$GIT_SHA --build-arg BUILD_TIME=$BUILD_TIME .
+docker build -t orders-service:local        -f src/OrdersService/OrdersService.Api/Dockerfile        --build-arg GIT_SHA=$GIT_SHA --build-arg BUILD_TIME=$BUILD_TIME .
+docker build -t inventory-service:local     -f src/InventoryService/InventoryService.Api/Dockerfile     --build-arg GIT_SHA=$GIT_SHA --build-arg BUILD_TIME=$BUILD_TIME .
+docker build -t notifications-service:local -f src/NotificationsService/NotificationsService.Api/Dockerfile --build-arg GIT_SHA=$GIT_SHA --build-arg BUILD_TIME=$BUILD_TIME .
+docker build -t dashboard-service:local     -f src/DashboardService/DashboardService.Api/Dockerfile     --build-arg GIT_SHA=$GIT_SHA --build-arg BUILD_TIME=$BUILD_TIME .
 
 minikube start
 minikube image load orders-service:local
 minikube image load inventory-service:local
+minikube image load notifications-service:local
 minikube image load dashboard-service:local
 
 # Namespace, then Postgres (Deployment + PVC) for both services
@@ -74,10 +82,13 @@ kubectl -n service-health-dashboard apply \
 kubectl -n service-health-dashboard rollout status deployment/orders-postgres
 kubectl -n service-health-dashboard rollout status deployment/inventory-postgres
 
-# Jaeger (traces UI) — nothing blocks on it being up first, a missing OTLP
-# endpoint just means empty traces, but it needs to exist eventually
+# Jaeger (traces UI) and RabbitMQ — nothing blocks on either being up first (orders-service's
+# publish is best-effort, notifications-service retries its own initial connect), but they
+# need to exist before the services that depend on them start doing anything useful with them
 kubectl -n service-health-dashboard apply -f k8s/jaeger/deployment.yaml -f k8s/jaeger/service.yaml
+kubectl -n service-health-dashboard apply -f k8s/rabbitmq/deployment.yaml -f k8s/rabbitmq/service.yaml
 kubectl -n service-health-dashboard rollout status deployment/jaeger
+kubectl -n service-health-dashboard rollout status deployment/rabbitmq
 
 # Migrations run as one-shot Jobs, not on pod startup — see "Architecture decisions" below
 kubectl -n service-health-dashboard apply -f k8s/orders-service/migration-job.yaml -f k8s/inventory-service/migration-job.yaml
@@ -88,10 +99,12 @@ kubectl -n service-health-dashboard wait --for=condition=complete job/inventory-
 kubectl -n service-health-dashboard apply \
   -f k8s/orders-service/deployment.yaml -f k8s/orders-service/service.yaml \
   -f k8s/inventory-service/deployment.yaml -f k8s/inventory-service/service.yaml \
+  -f k8s/notifications-service/deployment.yaml -f k8s/notifications-service/service.yaml \
   -f k8s/dashboard-service/deployment.yaml -f k8s/dashboard-service/service.yaml
 
 kubectl -n service-health-dashboard rollout status deployment/orders-service
 kubectl -n service-health-dashboard rollout status deployment/inventory-service
+kubectl -n service-health-dashboard rollout status deployment/notifications-service
 kubectl -n service-health-dashboard rollout status deployment/dashboard-service
 
 # Prometheus (scrapes the three app pods above via their prometheus.io/* annotations —
@@ -111,8 +124,10 @@ kubectl -n service-health-dashboard rollout status deployment/grafana
 # and needs its terminal left open for the tunnel to stay up
 minikube service dashboard-service -n service-health-dashboard
 
-# Same for Jaeger's UI, Prometheus's UI, and Grafana, each in their own terminal
+# Same for Jaeger's UI, RabbitMQ's management UI, Prometheus's UI, and Grafana, each in
+# their own terminal
 minikube service jaeger -n service-health-dashboard
+minikube service rabbitmq -n service-health-dashboard
 minikube service prometheus -n service-health-dashboard
 minikube service grafana -n service-health-dashboard
 ```
@@ -124,7 +139,7 @@ ConfigMap mounts the way it does whole-directory mounts.
 
 ### Troubleshooting: `minikube image load` silently keeping a stale image
 
-All three images are tagged with a fixed tag (`:local`), not a per-build tag
+All four images are tagged with a fixed tag (`:local`), not a per-build tag
 like a git SHA — deliberate for a local dev loop, but it has a sharp edge:
 after you rebuild an image (`docker build -t orders-service:local ...`) and
 run `minikube image load orders-service:local` again, the node can keep
@@ -216,6 +231,16 @@ One dashboard, four panels chosen for what they say about *this* system specific
 
 ![Grafana dashboard showing an inventory-service outage and automatic recovery across all four panels](docs/screenshots/grafana-dashboard-incident-and-recovery.jpg)
 
+## Events (RabbitMQ)
+
+`orders-service` publishes `order.created`/`order.confirmed`/`order.cancelled` to a durable topic exchange (`orders`) after each state change commits to Postgres — never before, and never as a condition for the HTTP response. Publishing is **best-effort**: a RabbitMQ outage is logged and counted (`orders_events_publish_failed_total`), not surfaced as a failed order. `notifications-service` binds its own queue to `order.*`, consumes independently, and logs a simulated confirmation — unlike orders-service, RabbitMQ *is* a hard dependency for it, so its own `/health/ready` reflects the connection directly. A message that fails to deserialize or process is dead-lettered (`orders-notifications.dlq`) instead of looping forever or being silently dropped.
+
+```bash
+curl http://localhost:8083/metrics | grep notifications_
+```
+
+**Why best-effort instead of a transactional outbox:** an outbox guarantees no event is ever lost even across a process crash, at the cost of an extra table, migration, and dispatcher loop. For this system, a dropped notification is a missed confirmation email — annoying, not a correctness problem the way a lost order or a double reservation would be. A transactional outbox is the natural upgrade if that trade-off ever stops being acceptable.
+
 ## Architecture decisions
 
 **Fail-closed, not optimistic.** `orders-service` rejects an order it can't confirm stock for, rather than accepting it and reconciling later. The alternative — accept now, settle later — was rejected because overselling is more expensive to unwind than a customer seeing a retryable `503`. Backed by a Polly v8 resilience pipeline (timeout, retry with backoff + jitter, circuit breaker) that only retries transient failures, never a `409` (insufficient stock) or `404`.
@@ -230,9 +255,10 @@ One dashboard, four panels chosen for what they say about *this* system specific
 
 ## Not done yet
 
-Step 6 (distributed tracing, structured logging, metrics, Prometheus + Grafana) is done — see "Distributed tracing", "Metrics", and "Metrics dashboards" above.
+Step 6 (distributed tracing, structured logging, metrics, Prometheus + Grafana) and step 7 (a third service and a real message bus) are done — see "Distributed tracing", "Metrics", "Metrics dashboards", and "Events (RabbitMQ)" above.
 
-- **A third service and a real message bus (step 7).** `notifications-service` doesn't exist yet; orders→inventory is the only inter-service call, and it's synchronous HTTP, not events. Deferred deliberately — see `CLAUDE.md` for why the bus comes after two services are stable, not before.
 - **CI/CD (step 8).** Everything above is built and deployed by hand (`docker build`, `minikube image load`, `kubectl apply`). No GitHub Actions pipeline yet for build/test/image push, let alone auto-deploy.
+- **Transactional outbox for event publishing.** orders-service's RabbitMQ publish is best-effort (see "Events" above), not transactionally tied to the order's own commit — a process crash in the narrow window between the two loses that one event. Acceptable for a missed notification; a natural upgrade if that trade-off ever needs to change.
+- **Grafana panels for notifications-service.** The dashboard (`k8s/grafana/`) covers orders/inventory only; `notifications_sent_total`/`notifications_failed_total` are scraped by Prometheus already but not yet visualized.
 
 Smaller, already-noted-but-deferred items live in `CLAUDE.md`: k8s-native service discovery for the dashboard instead of a config-driven list, SSE/WebSocket instead of polling, and a real deploy timestamp from the Kubernetes API instead of each service's build time.

@@ -1,0 +1,15 @@
+# ClusterIP: no public API surface of value — notifications-service only exposes
+# /health/*, /version, /metrics, none of which need to be reachable from outside the cluster.
+# Prometheus scrapes it via the pod IP (kubernetes_sd_configs), not through this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: notifications-service
+  namespace: service-health-dashboard
+spec:
+  type: ClusterIP
+  selector:
+    app: notifications-service
+  ports:
+    - port: 8080
+      targetPort: 8080

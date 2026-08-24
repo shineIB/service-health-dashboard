@@ -1499,6 +1499,59 @@ men inte fixat i förebyggande syfte här.
    — riktiga värden bakade in av CI:t, inte `unknown`, och SHA:n matchar
    exakt den commit som triggade den gröna körningen.
 
+## Uppföljning — repo-finputs: beskrivning/topics, CI-failure-notiser, en tredje runda på metrics-flakigheten
+
+**GitHub-beskrivning + topics** satta via `gh repo edit` (`dotnet`,
+`microservices`, `kubernetes`, `opentelemetry`, `rabbitmq`, `aspnetcore`).
+
+**Beslut — auto-skapa ett GitHub-issue på en röd `master`, inte ett
+konto-notis-inställning.** Det finns ingen publik GitHub-API för det
+personliga "mejla mig bara vid misslyckade Actions"-kontoinställningen
+(Settings → Notifications → Actions) — den går inte att sätta via `gh`/API,
+bara klicka i UI:t själv. Istället: ett nytt `notify-on-failure`-jobb
+(`if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/master'`,
+beror på alla tre övriga jobb) skapar ett GitHub-issue taggat `ci-failure`
+med länk till körningen, via `actions/github-script` (ingen extern secret
+behövs, bara `GITHUB_TOKEN` med `issues: write`, scopeat till just det
+jobbet). Ett öppet issue syns på repots förstasida samma sätt som README:s
+CI-badge är tänkt att synas — kompletterar den, ersätter den inte.
+
+**Det här jobbet bevisade sig självt på riktigt, inte bara i teorin.**
+Nästa push (se nedan) råkade faktiskt faila `Build & test` igen — och
+`notify-on-failure` triggade korrekt, skapade issue #1
+("CI failed on master (031fb81)"). Stängt manuellt efter fixen nedan
+landat och `master` blivit grön igen (`gh issue close 1`).
+
+**Metrics-flakigheten (se förra uppföljningen) var INTE löst av förra
+fixen — en tredje, mer grundlig runda krävdes.** Samma push som triggade
+issue #1 ovan visade att även den hårdare fixen (omscrape + färskt
+`/version`-anrop varje varv, 20s) inte räckte:
+`http_server_request_duration` dök fortfarande aldrig upp, trots 20 riktiga
+sekunder och flera riktiga requests. Mer avslöjande: **inte ens
+`aspnetcore_routing_match_attempts_total`/`http_server_active_requests`**
+(som faktiskt synts i den allra första failade körningen, innan någon
+poll-logik fanns) dök upp i de två efterföljande, hårdare-pollande
+försöken — trots fler requests totalt, inte färre. Ordningen är bakvänd
+mot vad en enkel "hann inte synas än"-race skulle ge.
+**Grundorsak inte slutgiltigt fastställd** — en rimlig men obekräftad
+misstanke: `NotificationsApiFactory` är den enda av de fyra tjänsternas
+testvärdar som håller en riktig bakgrundskonsument (`OrderEventConsumer`)
+med en levande RabbitMQ-anslutning igång genom hela testet, vilket kan
+konkurrera om vad .NET-runtimen behöver för att Meter/DiagnosticListener-
+prenumerationen för just ASP.NET Core-hosting-mätvärden ska bli klar —
+men det är en kvalificerad gissning, inte ett bevisat svar, och att gissa
+hårdare konvergerade inte efter tre försök.
+**Fix, tredje och sista omgången:** sluta hävda en specifik
+auto-instrumenterings-mätvärde alls. Testet asserterar nu på `target_info`
+— det enda som faktiskt synts i **alla** tre misslyckade körningar (OTel
+Resource-metadata, skrivs så fort `MeterProvider` startar, oberoende av
+någon request). Ett ärligt svagare test än systertjänsternas motsvarighet,
+men ett som inte påstår en tillförlitlighetsgaranti som upprepad, riktig
+verifiering faktiskt motbevisade.
+**Verifierat:** `gh run watch` på körningen efter fixen — helt grön,
+inklusive att `notify-on-failure`-jobbet korrekt **hoppades över** (inte
+kördes) eftersom inget faktiskt failade den gången.
+
 Nästa steg: mindre uppföljningar som redan är noterade (notifications-/
 outbox-paneler i Grafana, k8s-native service discovery för dashboard,
 SSE/WebSocket istället för polling, alerting på övergivna outbox-rader).

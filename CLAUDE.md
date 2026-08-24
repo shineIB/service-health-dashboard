@@ -1166,8 +1166,149 @@ scrapear redan tjänsten, bara inte visualiserat), och att svepa igenom
 `InventoryClientOptions` för samma latenta `builder.Configuration`-mönster
 som fixades för `RabbitMqOptions` ovan.
 
+## Steg 7.5 — transactional outbox + idempotent konsument. Klart och verifierat.
+
+Steg 7 dokumenterade explicit "direkt publish efter DB-commit, inte
+transactional outbox" som ett medvetet val för det steget, med outbox
+noterat som naturligt nästa steg om avvägningen någonsin slutade vara
+acceptabel. Beställt uttryckligen som ett eget steg direkt efteråt — inte
+en ångrad bedömning, bara nästa steg i kön, som redan förutspått.
+
+**Producentsidan — outbox i samma transaktion som ordern.**
+
+- Ny `OutboxMessages`-tabell i orders-service:s Postgres (`Id`, `OrderId`,
+  `EventType`, `PayloadJson`, `CreatedAtUtc`, `PublishedAtUtc` (nullable),
+  `Attempts`, `LastError`), migration `AddOutbox`. `Id` fungerar som
+  eventets stabila identitet genom hela dess liv — genererad en gång vid
+  enqueue, återanvänd oförändrad i varje efterföljande publiceringsförsök
+  (inklusive retries efter en krasch). Det är precis den stabiliteten som
+  gör dedupe på konsumentsidan möjlig (se nedan).
+- `IOrderEventOutbox` (Domain, ersätter `IEventPublisher` från steg 7) har
+  synkrona `Enqueue*`-metoder — ingen I/O, bara att lägga en rad i
+  `OrdersDbContext`s change tracker. `EfOrderEventOutbox` (Infrastructure)
+  implementerar den. `OrderEndpoints.cs` anropar `outbox.Enqueue*` **före**
+  `repository.SaveChangesAsync`, inte efter som i steg 7 — det är den
+  omkastningen som gör ordern och outbox-raden till en och samma
+  transaktion. `OrderRepository` och `EfOrderEventOutbox` delar samma
+  scoped `OrdersDbContext`-instans inom en request, vilket DI-containern
+  redan garanterar (båda är Scoped) — ingen explicit transaktion behövs.
+- `OutboxDispatcher` (`BackgroundService`, samma
+  `PeriodicTimer`+`IServiceScopeFactory`-mönster som inventory-service:s
+  `ReservationExpiryService`) pollar var 2:a sekund (`Outbox:PollIntervalSeconds`),
+  läser opublicerade rader (`PublishedAtUtc IS NULL`, batch om 20, äldst
+  först), försöker publicera var och en via `RabbitMqOutboxSender` (samma
+  publisher-confirms-baserade RabbitMQ-logik som fanns i steg 7:s
+  `RabbitMqEventPublisher`, nu utan catch-and-swallow — dispatchern måste
+  se felet för att kunna retrya). Lyckat försök sätter `PublishedAtUtc`;
+  misslyckat ökar `Attempts`/`LastError` och lämnas kvar för nästa poll.
+  **Ingen max-attempts-gräns eller egen DLQ för outbox-rader** — en rad som
+  aldrig kan publiceras (inte bara transient nere, utan strukturellt
+  trasig) skulle behöva larmning/manuell hantering, och det finns ingen
+  konsument av den signalen än. Noterat i README under "Not done yet",
+  inte dolt.
+- orders-service anropar alltså aldrig RabbitMQ från request-vägen längre
+  — `POST /orders` beror bara på Postgres, samma som innan steg 7 ens
+  fanns. Ännu starkare garanti än steg 7:s "blockerar aldrig ordern":
+  där kunde en publicering fortfarande *försökas* synkront (och svälja
+  sitt eget fel); nu finns det inget publiceringsförsök alls i requesten.
+
+**Konsumentsidan — idempotens via EventId, inte via databas.**
+
+- `IProcessedEventStore` (Domain) + `InMemoryProcessedEventStore`
+  (Infrastructure): `ConcurrentDictionary<Guid, DateTimeOffset>` med
+  opportunistisk sanering (varje anrop städar bort poster äldre än 1 timme)
+  istället för en egen sweep-`BackgroundService` — volymen är för liten för
+  att motivera en till bakgrundstjänst bara för det. `TryAdd` är atomärt,
+  samma korrekthetsegenskap som inventory-service:s
+  idempotens-via-orderId-uppslag redan bygger på.
+- **In-memory, inte en databas — medvetet, inte en genväg.**
+  notifications-service har ingen databas (etablerat beslut från steg 7:
+  tjänstens hela poäng är att vara enkel och umbärlig). Dedupe-fönstret
+  överlever alltså inte en processomstart: ett event som redeliveras
+  *efter* en omstart (RabbitMQ köar om en oackad leverans, podden startar
+  om, först då kommer omleveransen) skulle behandlas igen. Acceptabelt här
+  eftersom sidoeffekten bara är en loggrad (`LoggingNotificationSender`),
+  inte en handling som måste vara garanterat engångsutförd — en riktig
+  databas vore rätt kallelse den dag sidoeffekten blir en som aldrig får
+  upprepas.
+- `OrderEventHandler.HandleAsync` anropar `TryMarkProcessedAsync(envelope.EventId, ...)`
+  direkt efter lyckad typmappning. Om `false` (redan sedd): loggar,
+  räknar `notifications.duplicate`, **ackar** (returnerar `true`) —
+  en dubblett är inte ett fel, och att nacka den skulle bara få RabbitMQ
+  att leverera om den för evigt.
+
+**Testtäckning:**
+
+- `OrderEndpointsTests` (orders-service) — `IOrderEventOutbox` **fejkas
+  inte längre**: `OrdersApiFactory` kör den riktiga `EfOrderEventOutbox`
+  mot den riktiga Testcontainers-Postgres:en, och testerna läser
+  `OutboxMessages`-tabellen direkt via en egen kortlivad `OrdersDbContext`
+  (`GetOutboxMessagesAsync`/`GetOutboxMessageCountAsync`) — det är den
+  faktiska transaktionsgarantin som testas, inte att en metod anropades.
+- Ny `OutboxDispatcherTests` (orders-service) — `OrdersApiCollection`
+  utökad med en `RabbitMqContainerFixture` (samma mönster som
+  notifications-service:s egen, duplicerad enligt "ingen delad
+  assembly"-principen). Skapar en order genom det riktiga API:et, gör
+  **inget** explicit publiceringsanrop, och pollar bara
+  `OutboxMessages.PublishedAtUtc` tills den riktiga, oförändrade
+  `OutboxDispatcher`-bakgrundstjänsten har publicerat den — bevisar att
+  hela kedjan (enqueue → commit → poll → publish → confirm) fungerar utan
+  någon testkod som härmar den.
+- `OrderEventHandlerTests` (notifications-service) — ny
+  `HandleAsync_WithARedeliveredEventId_AcksWithoutSendingASecondTime`:
+  anropar `HandleAsync` två gånger med **samma** handbyggda payload (samma
+  `EventId`), bekräftar att sändaren bara anropas en gång och att båda
+  anropen ackar. Använder den riktiga `InMemoryProcessedEventStore`
+  (ingen I/O, ingen anledning att fejka den) — dedupe-logiken som testas
+  är den faktiska, inte en stand-in för den.
+- 90 tester totalt i lösningen (upp från 88 i steg 7), alla gröna.
+
+**Verifierat på riktigt, de två scenarierna som efterfrågades — inte bara
+testerna ovan:**
+
+1. **Inget event går förlorat vid ett RabbitMQ-avbrott.**
+   `docker compose stop rabbitmq`, skapade en order — `POST /orders` → 201
+   (bekräftar att skrivvägen är helt frikopplad från RabbitMQ, inte bara
+   "bäst-ansträngning-frikopplad" som i steg 7). Läste `OutboxMessages`
+   direkt via `psql` i `postgres`-containern: raden fanns, `PublishedAtUtc`
+   var `NULL`, `Attempts` steg (dispatcher-pollningen försökte och
+   misslyckades om och om igen medan RabbitMQ var nere). `docker compose
+   start rabbitmq`, väntade in nästa pollningscykel: `PublishedAtUtc` sattes
+   (`Attempts` hade hunnit till 6 innan den lyckades), och
+   `notifications-service`s logg visade eventet konsumerat och en
+   bekräftelse "skickad" — samma order-/kund-ID som skapades medan
+   RabbitMQ var nere.
+2. **Samma event levererat två gånger → notifications-service agerar bara
+   en gång.** Inte simulerat med ett handgjort dubblett-meddelande — den
+   redan publicerade outbox-raden återställdes till `PublishedAtUtc = NULL`
+   direkt i Postgres (`UPDATE "OutboxMessages" SET "PublishedAtUtc" = NULL
+   WHERE ...`), vilket tvingade den riktiga, oförändrade
+   `OutboxDispatcher`:n att återpublicera **samma rad, samma EventId**
+   genom den faktiska produktionskodvägen — en genuin at-least-once-
+   omleverans, inte en konstruerad efterlikning av en. Resultat: loggarna
+   visade exakt en "Sending ... confirmation"-rad och en separat
+   "Duplicate delivery of event ...; already processed, skipping."-rad för
+   samma order-ID; `notifications_sent_total` förblev på 1,
+   `notifications_duplicate_total` gick till 1.
+3. Full sekvens replikerad i minikube (samma kluster som tidigare steg):
+   byggde om `orders-service`/`notifications-service`-images, skalade ner
+   till 0 innan `image rm`/`image load` (samma redan dokumenterade
+   stale-tag-fälla), körde om `orders-migrate`-Jobbet (gammalt, redan
+   `Completed`-jobb fanns inte längre kvar att städa bort denna gång) för
+   att applicera `AddOutbox`-migrationen, skalade upp igen. Skapade en
+   order genom klustrets riktiga NodePort/Service-kedja: `OutboxMessages`
+   visade `PublishedAtUtc` satt efter ett enda försök (`Attempts: 0`,
+   RabbitMQ var frisk hela tiden i den här omgången) och
+   `notifications-service`s poddloggar visade konsumtionen — samma
+   bekräftelse som i docker-compose-verifieringen, nu genom riktig k8s-DNS/
+   Service-routing.
+
+**Medvetet inte gjort i det här passet** (noterat i README under "Not done
+yet"): max-attempts/larmning för outbox-rader som aldrig kan publiceras,
+Grafana-paneler för notifications-/outbox-räknarna.
+
 Nästa steg: steg 8 kvarstår redan löst (CI klart sedan tidigare) — nästa
 naturliga arbete är antingen CD (auto-deploy) eller någon av de mindre
-uppföljningarna som redan är noterade (transactional outbox,
-notifications-paneler i Grafana, k8s-native service discovery för
+uppföljningarna som redan är noterade (max-attempts/larmning för outbox,
+notifications-/outbox-paneler i Grafana, k8s-native service discovery för
 dashboard, SSE/WebSocket istället för polling).

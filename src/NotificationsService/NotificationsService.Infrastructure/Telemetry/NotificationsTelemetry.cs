@@ -19,4 +19,9 @@ public static class NotificationsTelemetry
 
     public static readonly Counter<long> NotificationsFailed =
         Meter.CreateCounter<long>("notifications.failed");
+
+    // Incremented when IProcessedEventStore recognizes a redelivered event — a healthy
+    // consequence of RabbitMQ's at-least-once guarantee, not a failure.
+    public static readonly Counter<long> NotificationsDuplicate =
+        Meter.CreateCounter<long>("notifications.duplicate");
 }

@@ -29,7 +29,7 @@ public static class ServiceCollectionExtensions
             .AddCheck<PostgresHealthCheck>(name: "postgres", tags: ["ready"], timeout: TimeSpan.FromSeconds(2));
 
         AddInventoryClient(services);
-        AddEventPublisher(services);
+        AddOutbox(services, configuration);
 
         return services;
     }
@@ -50,11 +50,20 @@ public static class ServiceCollectionExtensions
             ?? throw new InvalidOperationException($"Missing configuration section '{sectionName}'.");
     }
 
-    private static void AddEventPublisher(IServiceCollection services)
+    private static void AddOutbox(IServiceCollection services, IConfiguration configuration)
     {
+        services.AddScoped<IOrderEventOutbox, EfOrderEventOutbox>();
+
         services.AddSingleton(serviceProvider => GetRequiredOptions<RabbitMqOptions>(serviceProvider, RabbitMqOptions.SectionName));
         services.AddSingleton<RabbitMqConnectionProvider>();
-        services.AddSingleton<IEventPublisher, RabbitMqEventPublisher>();
+        services.AddSingleton<RabbitMqOutboxSender>();
+
+        // OutboxOptions has no test overrides to worry about (OutboxDispatcher only ever reads
+        // it after Build(), like every other BackgroundService), so the plain Configure<T>
+        // pattern is fine here — unlike RabbitMqOptions/InventoryClientOptions above, which are
+        // resolved during request/HttpClient construction and need GetRequiredOptions instead.
+        services.Configure<OutboxOptions>(configuration.GetSection(OutboxOptions.SectionName));
+        services.AddHostedService<OutboxDispatcher>();
     }
 
     private static void AddInventoryClient(IServiceCollection services)

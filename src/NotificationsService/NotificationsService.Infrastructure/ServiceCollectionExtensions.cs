@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using NotificationsService.Domain;
 
@@ -13,6 +14,8 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton<RabbitMqConnectionProvider>();
         services.AddSingleton<INotificationSender, LoggingNotificationSender>();
+        services.TryAddSingleton(TimeProvider.System);
+        services.AddSingleton<IProcessedEventStore, InMemoryProcessedEventStore>();
         services.AddSingleton<OrderEventHandler>();
         services.AddHostedService<OrderEventConsumer>();
 

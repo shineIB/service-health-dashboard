@@ -231,15 +231,19 @@ One dashboard, four panels chosen for what they say about *this* system specific
 
 ![Grafana dashboard showing an inventory-service outage and automatic recovery across all four panels](docs/screenshots/grafana-dashboard-incident-and-recovery.jpg)
 
-## Events (RabbitMQ)
+## Events (RabbitMQ, transactional outbox, idempotent consumer)
 
-`orders-service` publishes `order.created`/`order.confirmed`/`order.cancelled` to a durable topic exchange (`orders`) after each state change commits to Postgres — never before, and never as a condition for the HTTP response. Publishing is **best-effort**: a RabbitMQ outage is logged and counted (`orders_events_publish_failed_total`), not surfaced as a failed order. `notifications-service` binds its own queue to `order.*`, consumes independently, and logs a simulated confirmation — unlike orders-service, RabbitMQ *is* a hard dependency for it, so its own `/health/ready` reflects the connection directly. A message that fails to deserialize or process is dead-lettered (`orders-notifications.dlq`) instead of looping forever or being silently dropped.
+`orders-service` never calls RabbitMQ from the request path. When an order is created/confirmed/cancelled, the corresponding event is written to an `OutboxMessages` row **in the same Postgres transaction** as the order change itself — one commit, both rows, or neither. A separate `OutboxDispatcher` background service polls that table (every 2s) and publishes unpublished rows to a durable topic exchange (`orders`, routing keys `order.created`/`confirmed`/`cancelled`); a row that fails to publish just stays unpublished and gets retried on the next poll, indefinitely — RabbitMQ being down never loses it, because it was already durably committed before any network call was attempted.
+
+`notifications-service` binds its own queue to `order.*` and consumes independently — RabbitMQ *is* a hard dependency for it (unlike orders-service), so its own `/health/ready` reflects the connection directly. Because RabbitMQ only guarantees *at-least-once* delivery (and the dispatcher's own retries can legitimately republish a row that was actually delivered, just not yet marked as such), a redelivered event is expected, not a bug: each event carries a stable `EventId` — the outbox row's own `Id`, reused unchanged across every delivery attempt — and the consumer tracks which ids it has already acted on, acking a duplicate without sending a second confirmation. A message that fails to deserialize or map to a known event type is dead-lettered (`orders-notifications.dlq`) instead of looping forever or being silently dropped.
 
 ```bash
 curl http://localhost:8083/metrics | grep notifications_
 ```
 
-**Why best-effort instead of a transactional outbox:** an outbox guarantees no event is ever lost even across a process crash, at the cost of an extra table, migration, and dispatcher loop. For this system, a dropped notification is a missed confirmation email — annoying, not a correctness problem the way a lost order or a double reservation would be. A transactional outbox is the natural upgrade if that trade-off ever stops being acceptable.
+**Why an outbox instead of a direct best-effort publish:** the first version of this (see git history) published directly to RabbitMQ right after the order's commit, catching and logging any failure so it could never fail the order itself — simpler, but with one real gap: a crash in the narrow window between the DB commit and the publish call lost that one event permanently, with nothing left anywhere to retry from. The outbox closes that gap by making the write itself the durable record — nothing is "in flight and unrecorded" at any point. The cost is a table, a migration, and a poll loop; worth it once the guarantee is "no event is ever lost," not "usually isn't."
+
+**Why in-memory idempotency, not a database, in notifications-service:** the service deliberately has no database (see "Architecture decisions" below). The dedupe window is an in-memory, time-bounded set of recently-seen `EventId`s — it does not survive a process restart, so a message redelivered *after* a restart (RabbitMQ requeues something unacked, the pod restarts, only then does the redelivery land) would be processed again. Acceptable here because the only side effect is a log line, not a real action; a persistent store (or reusing Postgres if this service ever gets one) would be the right call the moment that side effect needs to never repeat.
 
 ## Architecture decisions
 
@@ -251,6 +255,8 @@ curl http://localhost:8083/metrics | grep notifications_
 
 **`/health/live` vs. `/health/ready`.** Live has no dependencies and is always healthy if the process is running; ready checks the database. Kubernetes uses live for restart decisions and ready for traffic routing. A single combined endpoint was rejected because it would turn a brief database hiccup into an unnecessary pod restart instead of just a short pause in traffic.
 
+**notifications-service has no database, on purpose.** Its only job is reacting to events it doesn't own — adding a database just to store a dedupe set (see "Events" above) would mean a fourth Postgres instance, a fourth migration story, and a fourth thing that can be down, for a service whose entire value is being simple and disposable. The in-memory idempotency store is the direct consequence of that choice, not an oversight.
+
 **The dashboard can't inherit anyone else's outage.** `dashboard-service`'s own `/health/ready` has zero registered checks, so it's structurally incapable of reporting unhealthy because a service it watches is down — confirmed above by scaling `inventory-service` to 0 while the dashboard stayed `Ready`. Tying its health to the services it monitors was rejected because that's exactly the tool you need most during an actual incident.
 
 ## Not done yet
@@ -258,7 +264,7 @@ curl http://localhost:8083/metrics | grep notifications_
 Step 6 (distributed tracing, structured logging, metrics, Prometheus + Grafana) and step 7 (a third service and a real message bus) are done — see "Distributed tracing", "Metrics", "Metrics dashboards", and "Events (RabbitMQ)" above.
 
 - **CI/CD (step 8).** Everything above is built and deployed by hand (`docker build`, `minikube image load`, `kubectl apply`). No GitHub Actions pipeline yet for build/test/image push, let alone auto-deploy.
-- **Transactional outbox for event publishing.** orders-service's RabbitMQ publish is best-effort (see "Events" above), not transactionally tied to the order's own commit — a process crash in the narrow window between the two loses that one event. Acceptable for a missed notification; a natural upgrade if that trade-off ever needs to change.
-- **Grafana panels for notifications-service.** The dashboard (`k8s/grafana/`) covers orders/inventory only; `notifications_sent_total`/`notifications_failed_total` are scraped by Prometheus already but not yet visualized.
+- **No max-attempts/alerting on outbox rows.** `OutboxDispatcher` retries a failed publish forever, on a fixed interval — right for "RabbitMQ is transiently down," but a row that can *never* publish (a structurally malformed payload, say) would retry silently forever with nothing surfacing it. No consumer of that signal exists yet.
+- **Grafana panels for notifications-service/the outbox.** The dashboard (`k8s/grafana/`) covers orders/inventory only; `notifications_sent_total`/`notifications_failed_total`/`notifications_duplicate_total` and the outbox's own publish counters are scraped by Prometheus already but not yet visualized.
 
 Smaller, already-noted-but-deferred items live in `CLAUDE.md`: k8s-native service discovery for the dashboard instead of a config-driven list, SSE/WebSocket instead of polling, and a real deploy timestamp from the Kubernetes API instead of each service's build time.

@@ -49,24 +49,28 @@ public class OrderEndpointsTests : IClassFixture<OrdersApiFactory>
 
         var body = await response.Content.ReadFromJsonAsync<OrderResponse>();
         _factory.InventoryClient.ReserveCalls.Should().ContainSingle(call => call.OrderId == body!.Id);
-        _factory.EventPublisher.CreatedOrderIds.Should().Contain(body!.Id);
+
+        var outboxMessages = await _factory.GetOutboxMessagesAsync(body!.Id);
+        outboxMessages.Should().ContainSingle(m => m.EventType == "order.created" && m.PublishedAtUtc == null);
     }
 
     [Fact]
-    public async Task CreateOrder_WhenInventoryReportsInsufficientStock_DoesNotPublishAnEvent()
+    public async Task CreateOrder_WhenInventoryReportsInsufficientStock_DoesNotEnqueueAnOutboxRow()
     {
         var client = _factory.CreateClient();
         _factory.InventoryClient.NextReserveResult = ReserveStockResult.InsufficientStock("Insufficient stock for product.");
         var request = ValidCreateOrderRequest();
+        var countBefore = await _factory.GetOutboxMessageCountAsync();
 
         var response = await client.PostAsJsonAsync("/orders", request);
 
         response.StatusCode.Should().Be(HttpStatusCode.Conflict);
-        _factory.EventPublisher.CreatedOrderIds.Should().BeEmpty("a rejected order was never persisted, so it must not be published either");
+        var countAfter = await _factory.GetOutboxMessageCountAsync();
+        countAfter.Should().Be(countBefore, "a rejected order was never persisted, so it must not be enqueued for publishing either");
     }
 
     [Fact]
-    public async Task ConfirmOrder_PublishesAnOrderConfirmedEvent()
+    public async Task ConfirmOrder_EnqueuesAnOrderConfirmedOutboxRow()
     {
         var client = _factory.CreateClient();
         var order = await CreateOrderAsync(client);
@@ -74,7 +78,8 @@ public class OrderEndpointsTests : IClassFixture<OrdersApiFactory>
         var response = await client.PostAsync($"/orders/{order.Id}/confirm", content: null);
 
         response.StatusCode.Should().Be(HttpStatusCode.OK);
-        _factory.EventPublisher.ConfirmedOrderIds.Should().Contain(order.Id);
+        var outboxMessages = await _factory.GetOutboxMessagesAsync(order.Id);
+        outboxMessages.Should().ContainSingle(m => m.EventType == "order.confirmed");
     }
 
     [Fact]
@@ -116,7 +121,9 @@ public class OrderEndpointsTests : IClassFixture<OrdersApiFactory>
         response.StatusCode.Should().Be(HttpStatusCode.OK);
         _factory.InventoryClient.ReleaseCalls.Should().ContainSingle(call =>
             call.OrderId == order.Id && call.ProductId == order.Items[0].ProductId);
-        _factory.EventPublisher.CancelledOrderIds.Should().Contain(order.Id);
+
+        var outboxMessages = await _factory.GetOutboxMessagesAsync(order.Id);
+        outboxMessages.Should().ContainSingle(m => m.EventType == "order.cancelled");
     }
 
     [Fact]

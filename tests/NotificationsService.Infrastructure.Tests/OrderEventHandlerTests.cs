@@ -8,15 +8,17 @@ using Xunit;
 namespace NotificationsService.Infrastructure.Tests;
 
 // Exercises OrderEventHandler directly with hand-built JSON payloads — this is the wire
-// contract orders-service's RabbitMqEventPublisher actually emits (OrderEventPayload), not a
-// shared type (see CLAUDE.md, step 7: no shared Contracts assembly between services). No
-// RabbitMQ connection involved: HandleAsync only needs a message body and an INotificationSender.
+// contract orders-service's outbox actually emits (OrderEventPayload), not a shared type (see
+// CLAUDE.md, step 7: no shared Contracts assembly between services). No RabbitMQ connection
+// involved: HandleAsync only needs a message body, an INotificationSender, and an
+// IProcessedEventStore — the real InMemoryProcessedEventStore is used as-is (no I/O, no fake
+// needed) so duplicate-detection tests exercise the real dedupe logic, not a stand-in for it.
 public class OrderEventHandlerTests
 {
-    private static byte[] ValidPayload(string eventType, Guid? orderId = null, Guid? customerId = null) =>
+    private static byte[] ValidPayload(string eventType, Guid? eventId = null, Guid? orderId = null, Guid? customerId = null) =>
         Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
         {
-            EventId = Guid.NewGuid(),
+            EventId = eventId ?? Guid.NewGuid(),
             EventType = eventType,
             OrderId = orderId ?? Guid.NewGuid(),
             CustomerId = customerId ?? Guid.NewGuid(),
@@ -24,7 +26,7 @@ public class OrderEventHandlerTests
         }));
 
     private static OrderEventHandler CreateHandler(FakeNotificationSender sender) =>
-        new(sender, NullLogger<OrderEventHandler>.Instance);
+        new(sender, new InMemoryProcessedEventStore(TimeProvider.System), NullLogger<OrderEventHandler>.Instance);
 
     [Theory]
     [InlineData("order.created", OrderEventType.Created)]
@@ -37,7 +39,7 @@ public class OrderEventHandlerTests
         var orderId = Guid.NewGuid();
         var customerId = Guid.NewGuid();
 
-        var acked = await handler.HandleAsync(ValidPayload(eventType, orderId, customerId), CancellationToken.None);
+        var acked = await handler.HandleAsync(ValidPayload(eventType, orderId: orderId, customerId: customerId), CancellationToken.None);
 
         acked.Should().BeTrue();
         sender.SentNotifications.Should().ContainSingle(n =>
@@ -77,5 +79,23 @@ public class OrderEventHandlerTests
         var acked = await handler.HandleAsync(ValidPayload("order.created"), CancellationToken.None);
 
         acked.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task HandleAsync_WithARedeliveredEventId_AcksWithoutSendingASecondTime()
+    {
+        var sender = new FakeNotificationSender();
+        var handler = CreateHandler(sender);
+        var eventId = Guid.NewGuid();
+        var payload = ValidPayload("order.created", eventId: eventId);
+
+        var firstAck = await handler.HandleAsync(payload, CancellationToken.None);
+        var secondAck = await handler.HandleAsync(payload, CancellationToken.None);
+
+        firstAck.Should().BeTrue();
+        // The redelivery is acked too, not nacked — it's a duplicate, not a failure, and
+        // nacking it would just cause RabbitMQ to redeliver it again forever.
+        secondAck.Should().BeTrue();
+        sender.SentNotifications.Should().HaveCount(1, "a redelivered event must not be acted on twice");
     }
 }

@@ -11,11 +11,13 @@ namespace NotificationsService.Infrastructure;
 public sealed class OrderEventHandler
 {
     private readonly INotificationSender _sender;
+    private readonly IProcessedEventStore _processedEventStore;
     private readonly ILogger<OrderEventHandler> _logger;
 
-    public OrderEventHandler(INotificationSender sender, ILogger<OrderEventHandler> logger)
+    public OrderEventHandler(INotificationSender sender, IProcessedEventStore processedEventStore, ILogger<OrderEventHandler> logger)
     {
         _sender = sender;
+        _processedEventStore = processedEventStore;
         _logger = logger;
     }
 
@@ -46,6 +48,23 @@ public sealed class OrderEventHandler
 
         activity?.SetTag("order.id", envelope.OrderId);
         activity?.SetTag("messaging.event_type", envelope.EventType);
+        activity?.SetTag("messaging.event_id", envelope.EventId);
+
+        // orders-service's outbox reuses the same EventId across every publish attempt of a
+        // given event (see OrdersService.Infrastructure.EfOrderEventOutbox), and RabbitMQ itself
+        // can redeliver an unacked message — either way, this is the same event arriving twice,
+        // not two events. Ack it (it's already been handled) without sending a second time.
+        var isNewEvent = await _processedEventStore.TryMarkProcessedAsync(envelope.EventId, cancellationToken);
+        if (!isNewEvent)
+        {
+            _logger.LogInformation(
+                "Duplicate delivery of event {EventId} ({EventType}) for order {OrderId}; already processed, skipping.",
+                envelope.EventId,
+                envelope.EventType,
+                envelope.OrderId);
+            NotificationsTelemetry.NotificationsDuplicate.Add(1, new KeyValuePair<string, object?>("event_type", envelope.EventType));
+            return true;
+        }
 
         var notification = new OrderNotification(envelope.OrderId, envelope.CustomerId, eventType, envelope.OccurredAtUtc);
 

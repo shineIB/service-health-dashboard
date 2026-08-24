@@ -1,5 +1,32 @@
 <Project>
 
+  <!--
+    Convention: never bind a typed options class straight off an `IConfiguration configuration`
+    parameter that was captured before `WebApplication.Build()` (e.g. the parameter passed into
+    an `Add<X>Infrastructure(IConfiguration configuration)` extension method, called from
+    Program.cs as `builder.Services.Add<X>Infrastructure(builder.Configuration)`).
+
+    That snapshot does not see configuration added later — in particular, a
+    WebApplicationFactory-based test's `ConfigureAppConfiguration` overrides (a real
+    Testcontainers connection string/host/port) only land in the *fully built* configuration.
+    Binding early doesn't throw or warn; it just silently keeps using the appsettings.json
+    default, which can pass tests for the wrong reason (see CLAUDE.md, step 7, for exactly that
+    happening with a leftover container masking the bug).
+
+    Instead, resolve options lazily from the DI container's own IConfiguration, after Build():
+      services.AddSingleton(sp => sp.GetRequiredService<IConfiguration>()
+          .GetSection(FooOptions.SectionName).Get<FooOptions>()
+          ?? throw new InvalidOperationException(...));
+    or, for things that aren't plain singletons (AddDbContext, AddHttpClient, ...), use their
+    (IServiceProvider, ...) configuration overload instead of the parameterless one.
+
+    Each service's Infrastructure/ServiceCollectionExtensions.cs has a private
+    `GetRequiredOptions<TOptions>` helper for this — reuse it there rather than writing the
+    binding inline again. Hit three times (the orders/inventory connection string, the CI
+    Testcontainers fixture, and RabbitMqOptions in both messaging services) before this comment
+    existed — three strikes is a systemic gap, not bad luck.
+  -->
+
   <PropertyGroup>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>

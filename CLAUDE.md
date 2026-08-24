@@ -1057,6 +1057,39 @@ override) faktiskt behöver läsa ett värde som sattes efter den punkten.
 Värt att svepa igenom `InventoryClientOptions` (samma mönster, ännu inte
 exercisead av ett failande test) vid ett senare tillfälle.
 
+### Uppföljning — InventoryClientOptions fixad, mönstret gjort svårt att göra fel
+
+Åtgärdat samma dag som ovan hittades, inte lämnat som en känd-men-olagad
+bugg. `AddInventoryClient` i `OrdersService.Infrastructure/ServiceCollectionExtensions.cs`
+läste `InventoryClientOptions` på exakt samma eagra sätt som `RabbitMqOptions`
+gjorde — bara aldrig exerciserad av ett failande test eftersom
+`OrdersApiFactory` ersätter `IInventoryClient` helt med en fejk (ingen
+WebApplicationFactory-override av `InventoryClient:BaseUrl` att missa).
+**Fix:** `AddHttpClient<IInventoryClient, InventoryClient>((serviceProvider, client) => ...)`
+— `(IServiceProvider, HttpClient)`-overloaden istället för `(HttpClient)`-
+overloaden, samma lazy-efter-Build-princip. Verifierat mot en riktig
+`docker compose`-stack (inte bara att testerna fortfarande går gröna): skapade
+lager och en order genom hela orders→inventory-kedjan, `POST /orders` → 201.
+
+**Tredje gången samma fälla är ett systemfel, inte otur** (databas-
+anslutningssträngen i steg 8-uppföljningen, `RabbitMqOptions` ovan, nu
+`InventoryClientOptions`) — löst genom att göra det rätta mönstret till
+vägen med minst motstånd, inte bara dokumentera det i efterhand:
+
+- Varje tjänsts `Infrastructure/ServiceCollectionExtensions.cs` har nu en
+  privat `GetRequiredOptions<TOptions>(IServiceProvider, string)`-hjälpare
+  (identisk i orders- och notifications-service, samma "ingen delad
+  assembly"-princip som redan gäller event-DTO:erna) — nästa typade
+  options-klass i den filen återanvänder hjälparen istället för att skriva
+  bindningen för hand igen.
+- `Directory.Build.props` (delad av alla projekt) har en kommentar överst
+  som förklarar fällan, den korrekta lösningen, och pekar på hjälpar-
+  metoden — vald framför en delad extension-metod i en ny delad assembly,
+  eftersom projektet redan medvetet inte har någon delad kod mellan
+  tjänsterna (se steg 7s "ingen delad Contracts-assembly"-beslut); en
+  kommentar i en fil som redan är gemensam för hela lösningen är
+  tillräckligt upptäckbar utan att bryta den principen.
+
 **Testtäckning:** `OrderEventHandlerTests` (giltig payload per event-typ →
 rätt mappad `OrderNotification` + ack; trasig JSON → nack; okänd event-typ →
 nack; sändaren kastar → nack, propagerar inte). `OrderEndpointsTests`

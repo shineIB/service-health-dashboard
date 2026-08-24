@@ -9,14 +9,7 @@ public static class ServiceCollectionExtensions
 {
     public static IServiceCollection AddNotificationsInfrastructure(this IServiceCollection services, IConfiguration configuration)
     {
-        // Resolved from the service provider's IConfiguration, not the `configuration` parameter
-        // (captured pre-Build) — WebApplicationFactory test overrides (a real Testcontainers
-        // RabbitMQ host/port) only land in the fully-built configuration. Same trap CLAUDE.md
-        // already documents for OrdersDbContext's connection string.
-        services.AddSingleton(serviceProvider =>
-            serviceProvider.GetRequiredService<IConfiguration>()
-                .GetSection(RabbitMqOptions.SectionName).Get<RabbitMqOptions>()
-                ?? throw new InvalidOperationException($"Missing configuration section '{RabbitMqOptions.SectionName}'."));
+        services.AddSingleton(serviceProvider => GetRequiredOptions<RabbitMqOptions>(serviceProvider, RabbitMqOptions.SectionName));
 
         services.AddSingleton<RabbitMqConnectionProvider>();
         services.AddSingleton<INotificationSender, LoggingNotificationSender>();
@@ -27,5 +20,20 @@ public static class ServiceCollectionExtensions
             .AddCheck<RabbitMqHealthCheck>(name: "rabbitmq", tags: ["ready"], timeout: TimeSpan.FromSeconds(2));
 
         return services;
+    }
+
+    // Every typed options class in this project should be resolved through this helper instead
+    // of binding straight off the `IConfiguration configuration` parameter passed into
+    // AddNotificationsInfrastructure — that parameter is captured *before*
+    // WebApplication.Build(), and WebApplicationFactory-based test overrides only land in the
+    // configuration that exists *after* Build(). Binding early silently ignores those overrides.
+    // Hit three times in this codebase before becoming a rule instead of a one-off fix — see
+    // Directory.Build.props and CLAUDE.md, step 7.
+    private static TOptions GetRequiredOptions<TOptions>(IServiceProvider serviceProvider, string sectionName)
+        where TOptions : class
+    {
+        return serviceProvider.GetRequiredService<IConfiguration>()
+            .GetSection(sectionName).Get<TOptions>()
+            ?? throw new InvalidOperationException($"Missing configuration section '{sectionName}'.");
     }
 }

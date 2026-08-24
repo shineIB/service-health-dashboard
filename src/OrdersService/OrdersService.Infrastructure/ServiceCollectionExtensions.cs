@@ -16,13 +16,10 @@ public static class ServiceCollectionExtensions
         // Resolved from the service provider's IConfiguration, not the `configuration` parameter
         // captured here: WebApplicationFactory-based tests inject configuration overrides (a real
         // Testcontainers connection string) that only land in the fully-built configuration, not
-        // in this pre-Build snapshot — same reasoning as Program.cs's app.Configuration read for
-        // Database:RunMigrationsOnStartup.
+        // in this pre-Build snapshot — see GetRequiredOptions below, and Directory.Build.props.
         services.AddDbContext<OrdersDbContext>((serviceProvider, builder) =>
         {
-            var options = serviceProvider.GetRequiredService<IConfiguration>()
-                .GetSection(InfrastructureOptions.SectionName).Get<InfrastructureOptions>()
-                ?? throw new InvalidOperationException($"Missing configuration section '{InfrastructureOptions.SectionName}'.");
+            var options = GetRequiredOptions<InfrastructureOptions>(serviceProvider, InfrastructureOptions.SectionName);
             builder.UseNpgsql(options.ConnectionString);
         });
 
@@ -31,38 +28,46 @@ public static class ServiceCollectionExtensions
         services.AddHealthChecks()
             .AddCheck<PostgresHealthCheck>(name: "postgres", tags: ["ready"], timeout: TimeSpan.FromSeconds(2));
 
-        AddInventoryClient(services, configuration);
+        AddInventoryClient(services);
         AddEventPublisher(services);
 
         return services;
     }
 
+    // Every typed options class in this project should be resolved through this helper (or the
+    // equivalent (serviceProvider, x) => ... factory pattern for things that aren't plain
+    // singletons, like AddDbContext/AddHttpClient above/below) instead of binding straight off
+    // the `IConfiguration configuration` parameter passed into AddOrdersInfrastructure — that
+    // parameter is captured *before* WebApplication.Build(), and WebApplicationFactory-based test
+    // overrides only land in the configuration that exists *after* Build(). Binding early silently
+    // ignores those overrides. Hit three times in this codebase before becoming a rule instead of
+    // a one-off fix — see Directory.Build.props and CLAUDE.md, step 7.
+    private static TOptions GetRequiredOptions<TOptions>(IServiceProvider serviceProvider, string sectionName)
+        where TOptions : class
+    {
+        return serviceProvider.GetRequiredService<IConfiguration>()
+            .GetSection(sectionName).Get<TOptions>()
+            ?? throw new InvalidOperationException($"Missing configuration section '{sectionName}'.");
+    }
+
     private static void AddEventPublisher(IServiceCollection services)
     {
-        // Resolved from the service provider's IConfiguration, not the `configuration` parameter
-        // captured here — same reasoning as AddDbContext<OrdersDbContext> above: WebApplicationFactory
-        // test overrides only land in the fully-built configuration, not this pre-Build snapshot.
-        services.AddSingleton(serviceProvider =>
-            serviceProvider.GetRequiredService<IConfiguration>()
-                .GetSection(RabbitMqOptions.SectionName).Get<RabbitMqOptions>()
-                ?? throw new InvalidOperationException($"Missing configuration section '{RabbitMqOptions.SectionName}'."));
+        services.AddSingleton(serviceProvider => GetRequiredOptions<RabbitMqOptions>(serviceProvider, RabbitMqOptions.SectionName));
         services.AddSingleton<RabbitMqConnectionProvider>();
         services.AddSingleton<IEventPublisher, RabbitMqEventPublisher>();
     }
 
-    private static void AddInventoryClient(IServiceCollection services, IConfiguration configuration)
+    private static void AddInventoryClient(IServiceCollection services)
     {
-        var inventoryOptions = configuration.GetSection(InventoryClientOptions.SectionName).Get<InventoryClientOptions>()
-            ?? throw new InvalidOperationException($"Missing configuration section '{InventoryClientOptions.SectionName}'.");
-
         // Applies to every named resilience pipeline in this service, not just this one —
         // there's only one today, but this is where a second one would pick it up for free.
         services.Configure<TelemetryOptions>(options =>
             options.TelemetryListeners.Add(new PollyActivityTelemetryListener()));
 
-        services.AddHttpClient<IInventoryClient, InventoryClient>(client =>
+        services.AddHttpClient<IInventoryClient, InventoryClient>((serviceProvider, client) =>
             {
-                client.BaseAddress = new Uri(inventoryOptions.BaseUrl);
+                var options = GetRequiredOptions<InventoryClientOptions>(serviceProvider, InventoryClientOptions.SectionName);
+                client.BaseAddress = new Uri(options.BaseUrl);
             })
             .AddStandardResilienceHandler(resilience =>
             {

@@ -6,7 +6,7 @@ namespace OrdersService.Infrastructure;
 // OutboxDispatcher, which already knows how to retry (leave the row unpublished, try again
 // next poll) and needs the exception to actually observe a failure, unlike the old
 // best-effort-from-the-request-path design this replaced (see CLAUDE.md, step 7.5).
-public sealed class RabbitMqOutboxSender
+public sealed class RabbitMqOutboxSender : IOutboxSender
 {
     private readonly RabbitMqConnectionProvider _connectionProvider;
     private readonly RabbitMqOptions _options;

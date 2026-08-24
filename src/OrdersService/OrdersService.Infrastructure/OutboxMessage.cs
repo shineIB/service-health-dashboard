@@ -15,4 +15,12 @@ public sealed class OutboxMessage
     public DateTimeOffset? PublishedAtUtc { get; set; }
     public int Attempts { get; set; }
     public string? LastError { get; set; }
+
+    // Set once Attempts reaches OutboxOptions.MaxAttempts — see OutboxDispatcher. Excluded from
+    // the dispatcher's pending-message query the same way PublishedAtUtc is, so a message that
+    // can never be published stops consuming a batch slot forever instead of crowding out
+    // messages behind it. The row and its full PayloadJson/LastError stay in the table for
+    // inspection; setting this back to null (e.g. via a manual UPDATE) re-queues it for another
+    // round of attempts.
+    public DateTimeOffset? FailedAtUtc { get; set; }
 }

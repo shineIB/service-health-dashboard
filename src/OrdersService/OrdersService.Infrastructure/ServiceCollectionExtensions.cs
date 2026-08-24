@@ -56,7 +56,7 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton(serviceProvider => GetRequiredOptions<RabbitMqOptions>(serviceProvider, RabbitMqOptions.SectionName));
         services.AddSingleton<RabbitMqConnectionProvider>();
-        services.AddSingleton<RabbitMqOutboxSender>();
+        services.AddSingleton<IOutboxSender, RabbitMqOutboxSender>();
 
         // OutboxOptions has no test overrides to worry about (OutboxDispatcher only ever reads
         // it after Build(), like every other BackgroundService), so the plain Configure<T>

@@ -233,7 +233,7 @@ One dashboard, four panels chosen for what they say about *this* system specific
 
 ## Events (RabbitMQ, transactional outbox, idempotent consumer)
 
-`orders-service` never calls RabbitMQ from the request path. When an order is created/confirmed/cancelled, the corresponding event is written to an `OutboxMessages` row **in the same Postgres transaction** as the order change itself — one commit, both rows, or neither. A separate `OutboxDispatcher` background service polls that table (every 2s) and publishes unpublished rows to a durable topic exchange (`orders`, routing keys `order.created`/`confirmed`/`cancelled`); a row that fails to publish just stays unpublished and gets retried on the next poll, indefinitely — RabbitMQ being down never loses it, because it was already durably committed before any network call was attempted.
+`orders-service` never calls RabbitMQ from the request path. When an order is created/confirmed/cancelled, the corresponding event is written to an `OutboxMessages` row **in the same Postgres transaction** as the order change itself — one commit, both rows, or neither. A separate `OutboxDispatcher` background service polls that table (every 2s) and publishes unpublished rows to a durable topic exchange (`orders`, routing keys `order.created`/`confirmed`/`cancelled`); a row that fails to publish just stays unpublished and gets retried on the next poll — RabbitMQ being down never loses it, because it was already durably committed before any network call was attempted. Retries are bounded, not infinite: after `Outbox:MaxAttempts` (default 20, ~40s of retrying) a row is marked `FailedAtUtc` and excluded from further attempts, logged at `Error`, so a row that can genuinely never publish stops consuming a batch slot forever — without that cutoff, enough such rows would eventually crowd out newer, healthy ones (`OrderBy(CreatedAtUtc)` always tries the oldest pending rows first). The row's payload and last error stay in Postgres either way; resetting `FailedAtUtc` to `NULL` re-queues it.
 
 `notifications-service` binds its own queue to `order.*` and consumes independently — RabbitMQ *is* a hard dependency for it (unlike orders-service), so its own `/health/ready` reflects the connection directly. Because RabbitMQ only guarantees *at-least-once* delivery (and the dispatcher's own retries can legitimately republish a row that was actually delivered, just not yet marked as such), a redelivered event is expected, not a bug: each event carries a stable `EventId` — the outbox row's own `Id`, reused unchanged across every delivery attempt — and the consumer tracks which ids it has already acted on, acking a duplicate without sending a second confirmation. A message that fails to deserialize or map to a known event type is dead-lettered (`orders-notifications.dlq`) instead of looping forever or being silently dropped.
 
@@ -243,7 +243,34 @@ curl http://localhost:8083/metrics | grep notifications_
 
 **Why an outbox instead of a direct best-effort publish:** the first version of this (see git history) published directly to RabbitMQ right after the order's commit, catching and logging any failure so it could never fail the order itself — simpler, but with one real gap: a crash in the narrow window between the DB commit and the publish call lost that one event permanently, with nothing left anywhere to retry from. The outbox closes that gap by making the write itself the durable record — nothing is "in flight and unrecorded" at any point. The cost is a table, a migration, and a poll loop; worth it once the guarantee is "no event is ever lost," not "usually isn't."
 
-**Why in-memory idempotency, not a database, in notifications-service:** the service deliberately has no database (see "Architecture decisions" below). The dedupe window is an in-memory, time-bounded set of recently-seen `EventId`s — it does not survive a process restart, so a message redelivered *after* a restart (RabbitMQ requeues something unacked, the pod restarts, only then does the redelivery land) would be processed again. Acceptable here because the only side effect is a log line, not a real action; a persistent store (or reusing Postgres if this service ever gets one) would be the right call the moment that side effect needs to never repeat.
+**Why in-memory idempotency, not a database, in notifications-service:** the service deliberately has no database (see "Architecture decisions" below). The dedupe set of recently-seen `EventId`s lives in one process's memory, which makes it **both per-process and per-instance**:
+
+- **Per-process:** it does not survive a restart. A message redelivered *after* a restart (RabbitMQ requeues something unacked, the pod restarts, only then does the redelivery land) would be processed again — the dedupe window resets to empty along with everything else in memory.
+- **Per-instance:** it is not shared across replicas. Today `notifications-service` runs as a single pod, so this doesn't come up — but RabbitMQ hands each message on a queue to *one* of its connected consumers (competing consumers), not to all of them, and it picks arbitrarily. Scale this deployment to 2+ replicas and a message delivered to pod A and a redelivery of the *same* message routed to pod B would not be deduped against each other — each pod only knows what it has personally seen.
+
+Both gaps are the same trade-off from two angles: this is safe **only** because the side effect being deduplicated is a log line (`LoggingNotificationSender`), not a real action — processing the same event twice costs nothing worse than a duplicate log entry. The moment that side effect becomes something external and consequential (an actual email/SMS send, a charge, a write to another system), in-memory state stops being enough on both counts, and the fix is the same for both: move the processed-set to storage every replica can see and that survives a restart — a shared database table (Postgres, if this service ever gets one) or a dedicated store like Redis, keyed by `EventId` with a TTL, checked with an atomic "insert if absent."
+
+## CI/CD
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR to `master`: restore, build, test the whole solution, then build all four service images (catches a broken Dockerfile early). On a push to `master` specifically — not on PRs — a separate job also **publishes** those four images to GitHub Container Registry, tagged with both the short git SHA and `latest`, built with the same `GIT_SHA`/`BUILD_TIME` build args as the local `docker build` commands above so a published image's `/version` endpoint shows a real commit and build time, not `"unknown"`.
+
+### Pulling published images
+
+```bash
+docker pull ghcr.io/shineib/orders-service:latest
+docker pull ghcr.io/shineib/inventory-service:latest
+docker pull ghcr.io/shineib/notifications-service:latest
+docker pull ghcr.io/shineib/dashboard-service:latest
+
+# Or pin to the exact commit an image was built from, instead of latest:
+docker pull ghcr.io/shineib/orders-service:<short-sha>
+```
+
+GHCR packages are public for this repo — no `docker login` needed to pull.
+
+### What this CI/CD pipeline does *not* do
+
+**There is no auto-deploy, and there cannot be one against this project's own Kubernetes target as it's set up today.** Everything in "Kubernetes (minikube)" above runs against a `minikube` cluster living on this machine's own Docker Desktop/Hyper-V — a GitHub-hosted runner has no network path to it, no `kubeconfig` for it, and nothing worth granting one even if it did (minikube isn't reachable from the internet, on purpose — it's a local dev cluster, not a deployment target). The pipeline's job ends at "an image exists in GHCR that `kubectl`/`minikube image load` could use next" — pulling it into minikube and rolling the Deployments is still the same manual `kubectl apply`/`minikube image load` sequence documented above. Claiming otherwise — a green checkmark that implies "and now it's live" — would be misleading about what actually happened. A real CD story would need a cluster GitHub Actions can actually reach (a cloud-hosted cluster, or a self-hosted runner with network access to this machine) plus something to drive the rollout (`kubectl set image`, ArgoCD/Flux watching the registry, etc.) — a different kind of infrastructure than "run it on my laptop," not a missing workflow step.
 
 ## Architecture decisions
 
@@ -261,10 +288,10 @@ curl http://localhost:8083/metrics | grep notifications_
 
 ## Not done yet
 
-Step 6 (distributed tracing, structured logging, metrics, Prometheus + Grafana) and step 7 (a third service and a real message bus) are done — see "Distributed tracing", "Metrics", "Metrics dashboards", and "Events (RabbitMQ)" above.
+Step 6 (distributed tracing, structured logging, metrics, Prometheus + Grafana), step 7 (a third service and a real message bus), and step 8's CI-and-image-publish half are done — see "Distributed tracing", "Metrics", "Metrics dashboards", "Events (RabbitMQ)", and "CI/CD" above.
 
-- **CI/CD (step 8).** Everything above is built and deployed by hand (`docker build`, `minikube image load`, `kubectl apply`). No GitHub Actions pipeline yet for build/test/image push, let alone auto-deploy.
-- **No max-attempts/alerting on outbox rows.** `OutboxDispatcher` retries a failed publish forever, on a fixed interval — right for "RabbitMQ is transiently down," but a row that can *never* publish (a structurally malformed payload, say) would retry silently forever with nothing surfacing it. No consumer of that signal exists yet.
+- **No auto-deploy.** Deliberately out of scope for this repo, not an oversight — see "What this CI/CD pipeline does *not* do" under "CI/CD" above for why a GitHub-hosted runner can't reach a local minikube cluster and what a real deploy target would actually require.
+- **No alerting on abandoned outbox rows.** `OutboxDispatcher` gives up on a row after `Outbox:MaxAttempts` (default 20, ~40s) and marks it `FailedAtUtc` instead of retrying forever — see "Events" above — but nothing currently watches for that happening. The row and its `LastError` stay in Postgres for manual inspection either way; a Grafana panel or alert on `orders_events_publish_abandoned_total` is the natural next step.
 - **Grafana panels for notifications-service/the outbox.** The dashboard (`k8s/grafana/`) covers orders/inventory only; `notifications_sent_total`/`notifications_failed_total`/`notifications_duplicate_total` and the outbox's own publish counters are scraped by Prometheus already but not yet visualized.
 
 Smaller, already-noted-but-deferred items live in `CLAUDE.md`: k8s-native service discovery for the dashboard instead of a config-driven list, SSE/WebSocket instead of polling, and a real deploy timestamp from the Kubernetes API instead of each service's build time.

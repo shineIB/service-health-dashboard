@@ -42,6 +42,8 @@ jobs:
             dockerfile: src/OrdersService/OrdersService.Api/Dockerfile
           - service: inventory-service
             dockerfile: src/InventoryService/InventoryService.Api/Dockerfile
+          - service: notifications-service
+            dockerfile: src/NotificationsService/NotificationsService.Api/Dockerfile
           - service: dashboard-service
             dockerfile: src/DashboardService/DashboardService.Api/Dockerfile
     steps:
@@ -56,3 +58,62 @@ jobs:
             -f ${{ matrix.dockerfile }} \
             -t ${{ matrix.service }}:ci \
             .
+
+  docker-publish:
+    name: Publish ${{ matrix.service }} image
+    runs-on: ubuntu-latest
+    needs: [build-and-test, docker-build]
+    # Push only on master, never on a pull_request — GITHUB_TOKEN on a PR from a fork has no
+    # package-write permission anyway, and a PR shouldn't publish an image regardless. This is
+    # the whole CD story: publish an image GitHub Actions can build and validate. It stops
+    # there — see README, "Pulling published images", for why auto-deploy to a local minikube
+    # cluster from a GitHub-hosted runner isn't something this repo pretends to have.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - service: orders-service
+            dockerfile: src/OrdersService/OrdersService.Api/Dockerfile
+          - service: inventory-service
+            dockerfile: src/InventoryService/InventoryService.Api/Dockerfile
+          - service: notifications-service
+            dockerfile: src/NotificationsService/NotificationsService.Api/Dockerfile
+          - service: dashboard-service
+            dockerfile: src/DashboardService/DashboardService.Api/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR image paths must be all-lowercase; github.repository_owner preserves the account's
+      # actual casing (ShineIB), which docker/build-push-action would otherwise reject.
+      - name: Compute image metadata
+        id: meta
+        run: |
+          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "git_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same GIT_SHA/BUILD_TIME build args as the local `docker build` commands in README, so a
+      # published image's /version endpoint shows a real commit and build time, not "unknown" —
+      # see the Dockerfile comments for why these aren't cache keys.
+      - name: Build and push ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          build-args: |
+            GIT_SHA=${{ steps.meta.outputs.git_sha }}
+            BUILD_TIME=${{ steps.meta.outputs.build_time }}
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.owner }}/${{ matrix.service }}:${{ steps.meta.outputs.git_sha }}
+            ghcr.io/${{ steps.meta.outputs.owner }}/${{ matrix.service }}:latest

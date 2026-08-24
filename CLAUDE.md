@@ -1307,8 +1307,86 @@ testerna ovan:**
 yet"): max-attempts/larmning för outbox-rader som aldrig kan publiceras,
 Grafana-paneler för notifications-/outbox-räknarna.
 
+## Steg 7.6 — poison-message-skydd i OutboxDispatcher. Klart och verifierat.
+
+Steg 7.5 lämnade uttryckligen kvar "ingen max-attempts-gräns" som ett
+medvetet gap, dokumenterat i README under "Not done yet". Genomlyst på
+begäran: **blockerar en rad som aldrig går att publicera raderna efter
+den?** Svaret var nyanserat, inte ett rent ja/nej, så båda halvorna av
+frågan besvarades:
+
+- **En enda poison-rad blockerade redan INTE de andra i samma batch.**
+  `OutboxDispatcher`s `foreach`-loop försöker varje rad i batchen oavsett
+  tidigare fel i samma pass, och `SaveChangesAsync` anropas bara en gång,
+  efter loopen — ett fel på rad 1 stoppar aldrig att rad 2–20 faktiskt
+  försöks. Det här var redan sant innan den här ändringen, bara aldrig
+  uttryckligen verifierat med ett test.
+- **Men en HOP av poison-rader större än BatchSize (20) skulle ha
+  gjort det.** Frågan `Where(PublishedAtUtc == null).OrderBy(CreatedAtUtc).Take(20)`
+  plockar alltid de äldsta väntande raderna först. Utan en gräns som
+  utesluter en rad som aldrig kommer att lyckas, skulle en hög av fler än
+  20 sådana rader (äldre än allt annat) permanent uppta varje batch-plats
+  — en genuint frisk rad som råkar hamna bakom dem skulle aldrig ens
+  försökas. Det här var den verkliga risken värd att stänga.
+
+**Fix:** nytt `FailedAtUtc`-fält (nullable) på `OutboxMessage` +
+`OutboxOptions.MaxAttempts` (default 20, ~40s vid standard-pollningen på
+2s — gott om marginal jämfört med de 6 försök/~12s en riktig
+RabbitMQ-omstart tog i steg 7.5s verifiering). När `Attempts` når
+`MaxAttempts` efter ett misslyckat försök: `FailedAtUtc` sätts, raden
+loggas på **Error**-nivå (skild från den vanliga retry-varningen på
+**Warning**-nivå) med ett tydligt "kommer INTE att försökas igen
+automatiskt"-meddelande, och en ny räknare
+(`orders.events.publish_abandoned`, taggad `event_type`) ökar — en egen
+signal skild från `orders.events.publish_failed` (ett enskilt
+misslyckat försök) eftersom det är antalet som ger upp som är värt att
+larma på. `FailedAtUtc IS NULL` lades till i dispatcherns
+pending-fråga (nu en sammansatt index på `(PublishedAtUtc, FailedAtUtc)`
+istället för två separata) — det är uteslutningen ur frågan, inte bara
+Error-loggen, som faktiskt stänger hop-scenariot ovan. Raden och dess
+fulla `PayloadJson`/`LastError` finns kvar i tabellen; att nollställa
+`FailedAtUtc` manuellt kör den genom fler försök igen (samma mekanik som
+redan visades i steg 7.5s omleverans-verifiering via en direkt `UPDATE`).
+
+**`RabbitMqOutboxSender` bakom ett nytt `IOutboxSender`-interface**
+(Infrastructure-internt, inte Domain — inget i Api eller Domain känner
+till det, bara `OutboxDispatcher` som anropar det) så att tester kan byta
+ut den mot en fejk som misslyckas på beställning, samma mönster som
+`FakeInventoryClient`/`FakeNotificationSender` redan använder för sina
+motsvarande externa beroenden.
+
+**Testtäckning:** ny `PoisonOutboxFactory` (delar Postgres-containern via
+`PostgresContainerFixture`, ingen RabbitMQ-container behövs — det här
+handlar om dispatcherns egen ge-upp-logik, inte själva publiceringsanropet,
+som redan är täckt av `OutboxDispatcherTests` mot en riktig broker), snabb
+pollning (1s) och lågt `MaxAttempts` (3) för ett snabbt, deterministiskt
+test, plus en `FakeOutboxSender` som alltid kastar.
+`OutboxDispatcherPoisonMessageTests`:
+- En rad som alltid misslyckas får `FailedAtUtc` satt efter exakt
+  `MaxAttempts` försök, med rätt `LastError`, och **slutar** anropas
+  därefter (bekräftat genom att vänta ytterligare en pollningscykel och
+  se att fejk-sändarens anropsräknare inte rör sig) — inte bara flaggad
+  medan dispatchern fortsätter hamra på den.
+- Två samtidiga poison-rader (från två olika ordrar) ger upp oberoende av
+  varandra — den första radens misslyckande hindrar inte den andra från
+  att försökas och själv nå `FailedAtUtc`.
+- 92 tester totalt i lösningen (upp från 90).
+
+**Upptäckt under testskrivning — ett enkelt men avslöjande hål i den nya
+testfixturen.** Första körningen av de nya testerna failade, men inte på
+poison-logiken: `PoisonOutboxFactory` bytte ut `IOutboxSender` men glömde
+`IInventoryClient` (som `OrdersApiFactory` redan gör) — utan den fejken
+gick `POST /orders` mot en riktig, onåbar `InventoryClient:BaseUrl` och
+svarade 503 innan ordern ens hann skapas, långt innan outbox-koden någonsin
+nåddes. Precis den typen av "testet bevisar fel sak av fel anledning"-fälla
+som redan synts två gånger tidigare i det här steget (se
+`builder.Configuration`-uppföljningarna) — nu i test-setup snarare än
+produktionskod, men samma lärdom: en ny factory måste medvetet kopiera ALLA
+beroenden den föregående factoryn redan fejkade, inte bara den man för
+tillfället bryr sig om.
+
 Nästa steg: steg 8 kvarstår redan löst (CI klart sedan tidigare) — nästa
 naturliga arbete är antingen CD (auto-deploy) eller någon av de mindre
-uppföljningarna som redan är noterade (max-attempts/larmning för outbox,
-notifications-/outbox-paneler i Grafana, k8s-native service discovery för
-dashboard, SSE/WebSocket istället för polling).
+uppföljningarna som redan är noterade (notifications-/outbox-paneler i
+Grafana, k8s-native service discovery för dashboard, SSE/WebSocket istället
+för polling).

@@ -20,22 +20,6 @@ public class MetricsEndpointTests : IClassFixture<NotificationsApiFactory>
         _rabbitMq = rabbitMq;
     }
 
-    private static async Task<string> ScrapeMetricsUntilAsync(HttpClient client, string expectedSubstring)
-    {
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        var last = string.Empty;
-        while (DateTime.UtcNow < deadline)
-        {
-            last = await (await client.GetAsync("/metrics")).Content.ReadAsStringAsync();
-            if (last.Contains(expectedSubstring, StringComparison.Ordinal))
-                break;
-
-            await Task.Delay(100);
-        }
-
-        return last;
-    }
-
     // Publishes directly onto the real container's "orders" exchange the same way
     // orders-service's RabbitMqEventPublisher does — this is the wire contract, not a shared
     // type (see CLAUDE.md, step 7). Declares the exchange idempotently first: the app's own
@@ -72,14 +56,27 @@ public class MetricsEndpointTests : IClassFixture<NotificationsApiFactory>
     public async Task Metrics_ReturnsPrometheusTextExposingAspNetCoreInstrumentation()
     {
         var client = _factory.CreateClient();
-        await client.GetAsync("/version");
 
-        // Same race as the other services' MetricsEndpointTests (see their comment): a request's
-        // http_server_request_duration measurement isn't always visible in the very next
-        // scrape — observed for real on GitHub Actions' runners (not just a theoretical race),
-        // where a one-shot scrape right after /version flaked twice in a row. Poll instead of
-        // asserting against a single read.
-        var body = await ScrapeMetricsUntilAsync(client, "http_server_request_duration");
+        // Polling /metrics alone (the pattern the other services' equivalent test gets away
+        // with) was not enough here on a loaded GitHub Actions runner: two runs in a row showed
+        // aspnetcore_routing_match_attempts_total/http_server_active_requests recorded from the
+        // very first request, but http_server_request_duration missing even after 5s of
+        // repeated /metrics scrapes with no new non-scrape request in between. Re-issuing a
+        // plain GET on every iteration — not just re-scraping — is what actually gives the
+        // duration histogram (recorded on response completion, not at request start like the
+        // other two) a fresh chance to be captured each time, instead of retrying a read that
+        // depends on one specific, possibly-lost early measurement.
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        var body = string.Empty;
+        while (DateTime.UtcNow < deadline)
+        {
+            await client.GetAsync("/version");
+            body = await (await client.GetAsync("/metrics")).Content.ReadAsStringAsync();
+            if (body.Contains("http_server_request_duration", StringComparison.Ordinal))
+                break;
+
+            await Task.Delay(250);
+        }
 
         body.Should().Contain("http_server_request_duration");
     }
